@@ -12,22 +12,6 @@ import streamlit as st
 # =========================
 # BSDV_CLEAN_DEFECT (LOCKED)
 # =========================
-# Fields used: Summary + Description
-# Ignore: log, version, build, reproduction, device lines, URLs, numbers
-# Decision:
-#   EXACT    -> normalized(full_text) identical
-#   SEMANTIC -> same intent/flow/behaviour after ignores (deterministic similarity)
-#
-# Output:
-#   SAFE_DELETE_DEFECT.csv columns:
-#     Issue Key (Delete), Duplicate Of (Keep), Type, Safe Delete
-#   Summary table
-#
-# Determinism:
-#   - Keep = earliest row in file order
-#   - Candidate generation and scoring are stable
-
-
 STOPWORDS = set("""
 a an the and or but if then else when while for to of in on at by with without from into
 is are was were be been being this that these those it its as
@@ -68,26 +52,20 @@ IGNORE_REGEXES = [
 
 
 def normalize_text(s: str) -> str:
-    """Normalize for EXACT comparisons and similarity."""
     if s is None or (isinstance(s, float) and pd.isna(s)):
         return ""
     s = str(s).lower()
-
     for pat in IGNORE_REGEXES:
         s = re.sub(pat, " ", s, flags=re.IGNORECASE)
 
-    # unify separators
     s = re.sub(r"[_/\\\-–—]", " ", s)
-    # drop punctuation
     s = re.sub(r"[^\w\s]", " ", s)
-    # collapse whitespace
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
 def tokenize(norm: str) -> List[str]:
-    toks = [t for t in norm.split(" ") if t and len(t) >= 3 and t not in STOPWORDS]
-    return toks
+    return [t for t in norm.split(" ") if t and len(t) >= 3 and t not in STOPWORDS]
 
 
 def jaccard_tokens(a: List[str], b: List[str]) -> float:
@@ -102,27 +80,19 @@ def seq_ratio(a: str, b: str) -> float:
 
 
 def stable_hash(s: str) -> int:
-    """Deterministic hash -> int"""
     return int(hashlib.md5(s.encode("utf-8")).hexdigest(), 16)
 
 
 def shingles(tokens: List[str], k: int = 3) -> List[str]:
-    """Token shingles for candidate generation."""
     if len(tokens) < k:
         return [" ".join(tokens)] if tokens else [""]
     return [" ".join(tokens[i : i + k]) for i in range(len(tokens) - k + 1)]
 
 
 def band_keys(tokens: List[str]) -> Set[str]:
-    """
-    Deterministic LSH-like banding:
-    - create 3-gram shingles
-    - take 6 band keys based on min-hash over different salted hashes
-    """
     sh = shingles(tokens, k=3)
     if not sh:
         return set()
-
     keys = set()
     for salt in ("A", "B", "C", "D", "E", "F"):
         m = None
@@ -151,18 +121,13 @@ def detect_bsdv_clean_defect(
     min_shared_tokens: int,
     max_candidates_per_row: int = 250,
 ) -> Tuple[pd.DataFrame, Dict[str, int]]:
-    """
-    Returns:
-      safe_delete_df, summary_dict
-    """
-    # Build normalized full text
     full = (df[summary_col].fillna("") + " " + df[desc_col].fillna("")).astype(str)
     norm = full.map(normalize_text)
     toks = norm.map(tokenize)
 
     issue_keys = df[key_col].astype(str).map(lambda x: x.strip())
 
-    # 1) EXACT: identical normalized text
+    # EXACT
     canonical_for_norm: Dict[str, str] = {}
     exact_dups: List[Dup] = []
     exact_deletes: Set[str] = set()
@@ -176,8 +141,7 @@ def detect_bsdv_clean_defect(
         else:
             canonical_for_norm[nf] = ik
 
-    # 2) SEMANTIC: candidate generation via banding, then score
-    # Build inverted index: band_key -> list(row_idx)
+    # SEMANTIC: LSH-like candidate gen + scoring
     band_index: Dict[str, List[int]] = {}
     bands_per_row: List[Set[str]] = []
 
@@ -195,17 +159,15 @@ def detect_bsdv_clean_defect(
         if ik_i in exact_deletes:
             continue
 
-        # Collect candidate indices from shared band keys
         cand: Set[int] = set()
         for bk in bands_per_row[i]:
             for j in band_index.get(bk, []):
-                if j < i:  # only earlier rows as KEEP candidates (deterministic)
+                if j < i:
                     cand.add(j)
 
         if not cand:
             continue
 
-        # Limit candidate set deterministically (by index)
         cand_sorted = sorted(cand)
         if len(cand_sorted) > max_candidates_per_row:
             cand_sorted = cand_sorted[:max_candidates_per_row]
@@ -224,7 +186,6 @@ def detect_bsdv_clean_defect(
             nj = norm.iloc[j]
             tj = toks.iloc[j]
 
-            # Quick filters
             shared = len(set(ti) & set(tj))
             if shared < min_shared_tokens:
                 continue
@@ -244,12 +205,12 @@ def detect_bsdv_clean_defect(
 
         if best_j is not None:
             keep = issue_keys.iloc[best_j]
-            # avoid mapping same delete multiple times
             if ik_i not in semantic_deletes:
                 semantic_dups.append(Dup(delete_key=ik_i, keep_key=keep, dup_type="SEMANTIC"))
                 semantic_deletes.add(ik_i)
 
     safe_rows = exact_dups + semantic_dups
+
     safe_delete_df = pd.DataFrame(
         [{
             "Issue Key (Delete)": d.delete_key,
@@ -283,12 +244,9 @@ with st.expander("Locked Rules", expanded=False):
         """
 **Fields used:** Summary + Description  
 **Ignored differences:** log / version / build / reproduction / device lines / URLs / numbers  
-**Decision:**
-- **EXACT:** normalized(full_text) identical → **Safe Delete = YES**
-- **SEMANTIC:** normalized text differs but same intent/behaviour via deterministic similarity → **Safe Delete = YES**
-- Otherwise: not listed (NOT DUPLICATE)
-
-**Keep policy:** earliest row is kept, later duplicates deleted (deterministic).
+**Output:**
+- Summary Table (tablo)
+- SAFE Delete List (tablo) + CSV download
         """
     )
 
@@ -328,7 +286,7 @@ with m2:
 with m3:
     col_desc = st.selectbox("Description column", cols, index=cols.index("Description") if "Description" in cols else 0)
 
-# Semantic settings (you can lock these by replacing sliders with constants)
+# Semantic settings (you can LOCK by removing sliders and hardcoding values)
 st.subheader("Semantic Settings (Deterministic)")
 t1, t2, t3 = st.columns(3)
 with t1:
@@ -341,11 +299,6 @@ with t3:
 run = st.button("Run BSDV_CLEAN_DEFECT", type="primary")
 
 if run:
-    for required in [col_key, col_summary, col_desc]:
-        if required not in df.columns:
-            st.error(f"Missing column: {required}")
-            st.stop()
-
     safe_df, summary = detect_bsdv_clean_defect(
         df=df,
         key_col=col_key,
@@ -359,12 +312,38 @@ if run:
 
     st.success("Analysis complete.")
 
-    st.subheader("Summary")
-    st.dataframe(pd.DataFrame([summary]), use_container_width=True)
+    # ---- Summary TABLE (Tablo) ----
+    st.subheader("Summary Table")
+    summary_df = pd.DataFrame([summary])
+    st.table(summary_df)  # table view (not interactive)
 
-    st.subheader("SAFE_DELETE_DEFECT.csv")
-    st.dataframe(safe_df, use_container_width=True)
+    # ---- SAFE DELETE LIST TABLE ----
+    st.subheader("SAFE Delete List (Table)")
 
+    show_exact = st.checkbox("Show EXACT", value=True)
+    show_sem = st.checkbox("Show SEMANTIC", value=True)
+
+    filtered = safe_df.copy()
+    allowed = set()
+    if show_exact:
+        allowed.add("EXACT")
+    if show_sem:
+        allowed.add("SEMANTIC")
+    if allowed:
+        filtered = filtered[filtered["Type"].isin(list(allowed))]
+    else:
+        filtered = filtered.iloc[0:0]
+
+    st.table(filtered)  # table view
+
+    # Optional: counts by Type
+    st.subheader("Type Breakdown")
+    if len(safe_df) == 0:
+        st.write("No SAFE_DELETE items found.")
+    else:
+        st.table(safe_df["Type"].value_counts().rename_axis("Type").reset_index(name="Count"))
+
+    # Download
     st.download_button(
         label="Download SAFE_DELETE_DEFECT.csv",
         data=to_csv_bytes(safe_df),

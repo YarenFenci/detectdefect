@@ -1,29 +1,4 @@
-# app.py
-# Duplicate Detection Pipeline (TF-IDF Candidates + BSDV Safe Delete + Optional Clustering)
-# -----------------------------------------------------------------------------
-# Config (as requested):
-# - Candidate Generation: TF-IDF cosine similarity, threshold >= 0.69
-# - SAFEDELETESTRICT: Jaccard >= 0.80 AND shared tokens >= 5
-# - Clustering: optional, connected components (graph) to group duplicates
-# - Output Columns:
-#     Issue Key (Keep), Issue Key (Delete), Duplicate Type, Similarity, Decision
-# - Goal: maximize candidate coverage while ensuring safe delete
-#
-# Notes:
-# - Uses Summary + Description (auto-detected column names)
-# - Ignores noisy parts (version/build/device/log/urls/numbers) via regex
-# - Deterministic KEEP selection:
-#     If Created exists and parseable: older KEEP
-#     Else: earlier row in file KEEP
-#
-# Run:
-#   streamlit run app.py
-#
-# requirements.txt (fast/stable):
-#   streamlit
-#   pandas
-#   numpy
-#   scikit-learn
+
 
 import re
 from collections import defaultdict, deque
@@ -38,11 +13,12 @@ import streamlit as st
 # Pipeline config (locked)
 # ----------------------------
 CANDIDATE_COS_THRESHOLD = 0.69
+TOP_K_NEIGHBORS = 20  # coverage knob (higher = more candidates)
 
-SAFE_JACCARD_THRESHOLD = 0.80
+# Updated SAFEDELETESTRICT rule
+SAFE_JACCARD_THRESHOLD = 0.75
 SAFE_MIN_SHARED_TOKENS = 5
-
-TOP_K_NEIGHBORS = 20  # increases candidate coverage without NxN cost
+SAFE_COSINE_OVERRIDE = 0.92  # OR condition
 
 STOPWORDS = set(
     """
@@ -157,7 +133,6 @@ def tfidf_topk_candidates(texts: list[str], topk: int):
     vec = TfidfVectorizer(min_df=1, ngram_range=(1, 2))
     X = vec.fit_transform(texts)
 
-    # brute is reliable for sparse; still fast for a few thousand items with top-k
     nn = NearestNeighbors(n_neighbors=topk + 1, metric="cosine", algorithm="brute")
     nn.fit(X)
 
@@ -168,10 +143,6 @@ def tfidf_topk_candidates(texts: list[str], topk: int):
 
 
 def connected_components_from_edges(n: int, edges: list[tuple[int, int]]):
-    """
-    Undirected connected components.
-    Returns: list of components (each a sorted list of node indices).
-    """
     adj = [[] for _ in range(n)]
     for a, b in edges:
         if a == b:
@@ -218,8 +189,8 @@ def main():
     # EXACT duplicates (normalized text)
     # ----------------------------
     seen_norm = {}
-    exact_pairs = []          # (keep_idx, delete_idx)
-    exact_delete_idx = set()  # to avoid cascading deletes
+    exact_pairs = []
+    exact_delete_idx = set()
 
     for i, nm in enumerate(work["_norm"]):
         if not nm:
@@ -238,7 +209,6 @@ def main():
     with st.spinner("Generating candidates with TF-IDF cosine (top-k neighbors)..."):
         nn_idx, nn_sim = tfidf_topk_candidates(work["_norm"].tolist(), TOP_K_NEIGHBORS)
 
-    # Build candidate pairs (deduped)
     cand_best = {}  # (min_i,max_i) -> best cosine
     for i in range(len(work)):
         for pos in range(nn_idx.shape[1]):
@@ -262,10 +232,10 @@ def main():
     # ----------------------------
     rows = []
 
-    # Track SAFE deletes to prevent multiple deletes of same issue (deterministic)
+    # Deterministic: prevent multiple deletes of same issue
     safe_deleted = set(exact_delete_idx)
 
-    # EXACT => SAFEDELETESTRICT
+    # EXACT -> SAFEDELETESTRICT
     for keep_idx, del_idx in exact_pairs:
         rows.append(
             {
@@ -277,10 +247,7 @@ def main():
             }
         )
 
-    # SEMANTIC candidates: if safe condition met -> SAFEDELETESTRICT else QA_REVIEW
-    # Important: we DO NOT auto-safe-delete based on cosine; cosine is only for candidate coverage.
     for a, b, cos_sim in candidate_pairs:
-        # don't try to delete something already marked exact delete
         keep_idx, del_idx = determine_keep_delete(a, b, created_dt)
         if del_idx in safe_deleted:
             continue
@@ -290,15 +257,20 @@ def main():
         shared = len(sa & sb)
         jac = jaccard(sa, sb)
 
-        if shared >= SAFE_MIN_SHARED_TOKENS and jac >= SAFE_JACCARD_THRESHOLD:
+        # Updated rule:
+        # SAFE if (jac>=0.75 AND shared>=5) OR (cos>=0.92)
+        is_safe = ((shared >= SAFE_MIN_SHARED_TOKENS and jac >= SAFE_JACCARD_THRESHOLD) or (cos_sim >= SAFE_COSINE_OVERRIDE))
+
+        if is_safe:
             decision = "SAFEDELETESTRICT"
             dup_type = "SEMANTIC"
-            sim_out = jac  # report Jaccard as similarity for SAFE (consistent with BSDV safety)
+            # Similarity: report cosine if it triggered safety override, else report jaccard
+            sim_out = cos_sim if cos_sim >= SAFE_COSINE_OVERRIDE else jac
             safe_deleted.add(del_idx)
         else:
             decision = "QA_REVIEW"
             dup_type = "SEMANTIC"
-            sim_out = cos_sim  # report cosine for review prioritization
+            sim_out = cos_sim
 
         rows.append(
             {
@@ -312,53 +284,42 @@ def main():
 
     out_df = pd.DataFrame(rows)
 
-    # Stable ordering: SAFE first, then QA_REVIEW; within, higher similarity first
     if not out_df.empty:
         order = {"SAFEDELETESTRICT": 0, "QA_REVIEW": 1}
         out_df["_ord"] = out_df["Decision"].map(order).fillna(9)
         out_df = out_df.sort_values(["_ord", "Similarity"], ascending=[True, False]).drop(columns=["_ord"])
 
     # ----------------------------
-    # Optional clustering (connected components)
+    # Optional clustering
     # ----------------------------
     cluster_df = None
     if enable_clustering and not out_df.empty:
-        # cluster edges based on ALL flagged pairs (safe + review)
-        # Use original indices by mapping keys back to indices
         key_to_idx = {k: i for i, k in enumerate(work["_key"].tolist())}
-
         edges = []
         for _, r in out_df.iterrows():
             ki = key_to_idx.get(r["Issue Key (Keep)"])
             kd = key_to_idx.get(r["Issue Key (Delete)"])
             if ki is None or kd is None:
                 continue
-            a, b = (ki, kd) if ki < kd else (kd, ki)
-            edges.append((a, b))
+            x, y = (ki, kd) if ki < kd else (kd, ki)
+            edges.append((x, y))
 
         comps = connected_components_from_edges(len(work), edges)
 
-        # represent each component as: cluster_id, size, keep_keys, members
-        # keep = deterministic: oldest by created else smallest index
         cluster_rows = []
         for cid, comp in enumerate(comps, start=1):
-            # pick keep idx
             keep_idx = comp[0]
             if created_dt is not None:
-                # choose oldest created among parseable, else fallback to smallest index
                 comp_created = [(i, created_dt.iloc[i]) for i in comp if pd.notna(created_dt.iloc[i])]
                 if comp_created:
                     keep_idx = sorted(comp_created, key=lambda x: x[1])[0][0]
+
             keep_key = work["_key"].iloc[keep_idx]
             members = [work["_key"].iloc[i] for i in comp]
             cluster_rows.append(
-                {
-                    "Cluster": cid,
-                    "Size": len(comp),
-                    "Keep": keep_key,
-                    "Members": ", ".join(members),
-                }
+                {"Cluster": cid, "Size": len(comp), "Keep": keep_key, "Members": ", ".join(members)}
             )
+
         cluster_df = pd.DataFrame(cluster_rows).sort_values(["Size", "Cluster"], ascending=[False, True])
 
     # ----------------------------
@@ -373,8 +334,9 @@ def main():
         [
             {"Metric": "Total issue count", "Count": total},
             {"Metric": "Candidate cosine threshold", "Count": CANDIDATE_COS_THRESHOLD},
-            {"Metric": "SAFEDELETESTRICT (Jaccard threshold)", "Count": SAFE_JACCARD_THRESHOLD},
-            {"Metric": "SAFEDELETESTRICT (min shared tokens)", "Count": SAFE_MIN_SHARED_TOKENS},
+            {"Metric": "SAFE: (Jaccard >=)", "Count": SAFE_JACCARD_THRESHOLD},
+            {"Metric": "SAFE: (shared tokens >=)", "Count": SAFE_MIN_SHARED_TOKENS},
+            {"Metric": "SAFE: (OR cosine >=)", "Count": SAFE_COSINE_OVERRIDE},
             {"Metric": "Top-K neighbors per issue", "Count": TOP_K_NEIGHBORS},
             {"Metric": "EXACT duplicates", "Count": exact_cnt},
             {"Metric": "SAFEDELETESTRICT total", "Count": safe_cnt},

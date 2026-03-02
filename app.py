@@ -1,323 +1,307 @@
-# app.py
-import re
-from dataclasses import dataclass
-from typing import Dict, List, Set, Tuple, Optional
 
+import re
+from collections import defaultdict
+from datetime import datetime
+from io import StringIO
+
+import numpy as np
 import pandas as pd
 import streamlit as st
 
+st.set_page_config(page_title="BSDV_CLEAN_DEFECT", layout="wide")
 
-# =========================
-# BSDV_CLEAN_DEFECT (LOCKED)
-# =========================
-# Fields used: Summary + Description
-# Ignore: log, version, build, reproduction/steps, device lines, URLs, numbers
-# Decision:
-#   EXACT    -> normalized(full_text) identical
-#   SEMANTIC -> same bug intent after ignores (deterministic token similarity)
-#
-# Output:
-#   - Summary counts (Total / Exact / Semantic / Safe delete)
-#   - SAFE delete list table + CSV download
-#
-# Determinism:
-#   - Keep = earliest row in file order
-#   - For each delete, pick the earliest matching keep
+st.title("BSDV_CLEAN_DEFECT (V2)")
+st.caption("Single-table output with Decision = SAFE_DELETE_STRICT / QA_REVIEW")
 
+# ----------------------------
+# Config (locked)
+# ----------------------------
+THRESH_MIN = 0.69
+THRESH_SAFE = 0.80
+MIN_SHARED_TOKENS = 5
 
-STOPWORDS = set("""
+STOPWORDS = set(
+    """
 a an the and or but if then else when while for to of in on at by with without from into
 is are was were be been being this that these those it its as
 ve veya ama eğer ise değil için ile
-""".split())
+""".split()
+)
 
+# NOTE: These are intentionally conservative / generic.
 IGNORE_REGEXES = [
-    # versions / builds
     r"\b(app\s*)?version\s*[:=]\s*[^\n\r]+",
     r"\bbuild\s*[:=]\s*[^\n\r]+",
-    r"\bver\s*[:=]\s*[^\n\r]+",
-    r"\b\d+\.\d+\.\d+(\.\d+)?\b",
-
-    # logs / stack traces
-    r"\blogs?\s*[:=]\s*[^\n\r]+",
-    r"\blogcat\s*[:=]\s*[^\n\r]+",
-    r"\bstack\s*trace\b[\s\S]*?(?=\n{2,}|\Z)",
-    r"\bstacktrace\b[\s\S]*?(?=\n{2,}|\Z)",
-
-    # reproduction / steps
-    r"\bsteps?\s*to\s*reproduce\b[\s\S]*?(?=\n{2,}|\Z)",
-    r"\breproduction\b[\s\S]*?(?=\n{2,}|\Z)",
-    r"\brepro\b[\s\S]*?(?=\n{2,}|\Z)",
-
-    # device-ish lines
     r"\bdevice\s*[:=]\s*[^\n\r]+",
-    r"\bmodel\s*[:=]\s*[^\n\r]+",
-    r"\bandroid\s*(version)?\s*[:=]\s*[^\n\r]+",
-    r"\bios\s*(version)?\s*[:=]\s*[^\n\r]+",
-
-    # URLs
+    r"\blogs?\s*[:=]\s*[^\n\r]+",
+    r"\brepro(duction)?\b.*",  # user asked to ignore reproduction info if present in desc
     r"https?://\S+",
-    r"www\.\S+",
-
-    # standalone numbers
+    r"\b\d+\.\d+\.\d+(\.\d+)?\b",
     r"\b\d+\b",
 ]
 
+# ----------------------------
+# Helpers
+# ----------------------------
+def pick_col(cols, must_have_any):
+    """Pick first column whose lowercase name contains any token in must_have_any."""
+    for c in cols:
+        cl = c.lower().strip()
+        if any(k in cl for k in must_have_any):
+            return c
+    return None
 
-def normalize_text(s: str) -> str:
-    if s is None or (isinstance(s, float) and pd.isna(s)):
-        return ""
-    s = str(s).lower()
 
+def normalize_text(summary: str, desc: str) -> str:
+    s = f"{'' if pd.isna(summary) else str(summary)} {'' if pd.isna(desc) else str(desc)}"
+    s = s.lower()
     for pat in IGNORE_REGEXES:
         s = re.sub(pat, " ", s, flags=re.IGNORECASE)
-
-    s = re.sub(r"[_/\\\-–—]", " ", s)
-    s = re.sub(r"[^\w\s]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
+    s = re.sub(r"[^\w\s]", " ", s)      # remove punctuation
+    s = re.sub(r"\s+", " ", s).strip()  # collapse whitespace
     return s
 
 
-def tokenize(norm: str) -> List[str]:
-    # drop stopwords + short tokens
-    toks = [t for t in norm.split() if t and len(t) >= 3 and t not in STOPWORDS]
+def tokenize(norm: str):
+    toks = []
+    for t in norm.split():
+        if len(t) < 3:
+            continue
+        if t in STOPWORDS:
+            continue
+        toks.append(t)
     return toks
 
 
-def jaccard_set(a: Set[str], b: Set[str]) -> float:
-    if not a or not b:
+def jaccard(a_set: set, b_set: set) -> float:
+    if not a_set or not b_set:
         return 0.0
-    inter = len(a & b)
-    uni = len(a | b)
+    inter = len(a_set & b_set)
+    uni = len(a_set | b_set)
     return inter / uni if uni else 0.0
 
 
-@dataclass(frozen=True)
-class Dup:
-    delete_key: str
-    keep_key: str
-    dup_type: str  # EXACT / SEMANTIC
-    safe_delete: str = "YES"
+def parse_created_series(s: pd.Series) -> pd.Series:
+    """
+    Try to parse created timestamps. Returns datetime64[ns] with NaT when unparseable.
+    Accepts Jira-style and generic formats.
+    """
+    # pandas to_datetime is flexible; errors='coerce' makes NaT
+    return pd.to_datetime(s, errors="coerce", utc=False)
 
 
-def detect_bsdv_clean_defect(
-    df: pd.DataFrame,
-    key_col: str,
-    summary_col: str,
-    desc_col: str,
-    # LOCKED defaults (change here once, not via UI, if you want)
-    semantic_jaccard_threshold: float = 0.80,   # aligns with “strong semantic”
-    min_shared_tokens: int = 5,
-) -> Tuple[pd.DataFrame, Dict[str, int]]:
-    # Build normalized full text
-    full = (df[summary_col].fillna("") + " " + df[desc_col].fillna("")).astype(str)
-    norm = full.map(normalize_text)
-
-    issue_keys = df[key_col].astype(str).map(lambda x: x.strip())
-
-    # EXACT duplicates: identical normalized text
-    canonical_for_norm: Dict[str, str] = {}
-    exact_dups: List[Dup] = []
-    exact_delete_set: Set[str] = set()
-
-    for i in range(len(df)):
-        ik = issue_keys.iloc[i]
-        nf = norm.iloc[i]
-        if nf in canonical_for_norm:
-            exact_dups.append(Dup(delete_key=ik, keep_key=canonical_for_norm[nf], dup_type="EXACT"))
-            exact_delete_set.add(ik)
-        else:
-            canonical_for_norm[nf] = ik
-
-    # SEMANTIC duplicates (deterministic):
-    # We do candidate generation by token index to avoid O(n^2) blowup.
-    tokens_list = norm.map(tokenize)
-    token_sets = tokens_list.map(set)
-
-    # Build inverted index: token -> list of row indices (only for tokens that appear not too frequently)
-    token_freq: Dict[str, int] = {}
-    for ts in token_sets:
-        for t in ts:
-            token_freq[t] = token_freq.get(t, 0) + 1
-
-    # Keep "useful" tokens (rare-ish) for blocking
-    # deterministic: threshold based on dataset size
-    n = len(df)
-    max_freq = max(5, int(n * 0.10))  # tokens appearing in >10% rows are too common
-    useful_tokens = {t for t, f in token_freq.items() if f <= max_freq}
-
-    inv: Dict[str, List[int]] = {}
-    for i in range(n):
-        for t in (token_sets.iloc[i] & useful_tokens):
-            inv.setdefault(t, []).append(i)
-
-    semantic_dups: List[Dup] = []
-    semantic_delete_set: Set[str] = set()
-
-    for i in range(n):
-        del_key = issue_keys.iloc[i]
-        if del_key in exact_delete_set:
-            continue
-
-        # gather candidates from shared useful tokens (only earlier rows as KEEP)
-        cand: Set[int] = set()
-        for t in (token_sets.iloc[i] & useful_tokens):
-            for j in inv.get(t, []):
-                if j < i:
-                    cand.add(j)
-
-        if not cand:
-            continue
-
-        best_keep_idx: Optional[int] = None
-        best_score = 0.0
-
-        si = token_sets.iloc[i]
-
-        # deterministic: evaluate candidates in ascending index
-        for j in sorted(cand):
-            keep_key = issue_keys.iloc[j]
-            if keep_key in exact_delete_set:
-                continue
-
-            sj = token_sets.iloc[j]
-
-            shared = len(si & sj)
-            if shared < min_shared_tokens:
-                continue
-
-            jac = jaccard_set(si, sj)
-            if jac < semantic_jaccard_threshold:
-                continue
-
-            # pick best score; tie-breaker = earlier keep (already ensured by j order)
-            if jac > best_score:
-                best_score = jac
-                best_keep_idx = j
-
-        if best_keep_idx is not None and del_key not in semantic_delete_set:
-            semantic_dups.append(Dup(delete_key=del_key, keep_key=issue_keys.iloc[best_keep_idx], dup_type="SEMANTIC"))
-            semantic_delete_set.add(del_key)
-
-    safe_rows = exact_dups + semantic_dups
-
-    safe_df = pd.DataFrame(
-        [{
-            "Issue Key (Delete)": d.delete_key,
-            "Duplicate Of (Keep)": d.keep_key,
-            "Type": d.dup_type,
-            "Safe Delete": d.safe_delete,
-        } for d in safe_rows]
-    )
-
-    # Counts
-    exact_count = len(exact_dups)
-    semantic_count = len(semantic_dups)
-
-    summary = {
-        "Total issue count": int(n),
-        "Exact duplicate count": int(exact_count),
-        "Semantic duplicate count": int(semantic_count),
-        "Safe delete total": int(len(safe_rows)),
-    }
-    return safe_df, summary
+def determine_keep_delete(i, j, created_dt: pd.Series | None):
+    """
+    Return (keep_idx, delete_idx) deterministically.
+    If created_dt exists and both parse -> older KEEP.
+    Else -> smaller index KEEP (earlier row).
+    """
+    if created_dt is not None:
+        ci, cj = created_dt.iloc[i], created_dt.iloc[j]
+        if pd.notna(ci) and pd.notna(cj):
+            if ci <= cj:
+                return i, j
+            return j, i
+    # fallback: earlier row KEEP
+    return (i, j) if i < j else (j, i)
 
 
-def to_csv_bytes(df: pd.DataFrame) -> bytes:
-    return df.to_csv(index=False).encode("utf-8")
+# ----------------------------
+# UI
+# ----------------------------
+uploaded = st.file_uploader("Upload defects CSV", type=["csv"])
 
-
-# =========================
-# Streamlit UI
-# =========================
-st.set_page_config(page_title="BSDV_CLEAN_DEFECT", layout="wide")
-st.title("BSDV_CLEAN_DEFECT — Defect Duplicate Cleaner (EXACT + SEMANTIC)")
-
-with st.expander("Locked Rules (BSDV_CLEAN_DEFECT)", expanded=False):
+with st.expander("Active rules (click to view)", expanded=False):
     st.markdown(
-        """
-**Fields used:** Summary + Description  
-**Ignored:** log / version / build / reproduction / device lines / URLs / numbers  
-**Output:** Summary counts + SAFE Delete list (table) + CSV
-        """
+        f"""
+- Fields used: **Summary + Description**
+- Ignore (inside text): version/build/device/log/repro/url/numbers
+- EXACT: normalized text **%100 identical**
+- SEMANTIC candidate: **shared tokens ≥ {MIN_SHARED_TOKENS}**
+- SEMANTIC thresholds:
+  - **Decision = SAFE_DELETE_STRICT** if similarity **≥ {THRESH_SAFE}**
+  - **Decision = QA_REVIEW** if similarity **{THRESH_MIN}–{THRESH_SAFE - 0.01:.2f}**
+- Output: **Single table** + summary
+"""
     )
 
-uploaded = st.file_uploader("Upload CSV", type=["csv"])
 if not uploaded:
-    st.info("Upload a CSV to run BSDV_CLEAN_DEFECT.")
     st.stop()
 
-# CSV read options
-c1, c2, c3, c4 = st.columns(4)
-with c1:
-    delimiter = st.selectbox("Delimiter", options=[",", ";", "\t", "|"], index=1)
-with c2:
-    encoding = st.selectbox("Encoding", options=["utf-8", "utf-8-sig", "latin-1"], index=0)
-with c3:
-    quotechar = st.selectbox("Quote char", options=['"', "'"], index=0)
-with c4:
-    preview_rows = st.number_input("Preview rows", min_value=5, max_value=200, value=20, step=5)
+# Read CSV robustly
+raw = uploaded.getvalue().decode("utf-8", errors="replace")
+df = pd.read_csv(StringIO(raw), sep=None, engine="python", on_bad_lines="skip")
 
-try:
-    df = pd.read_csv(uploaded, sep=delimiter, encoding=encoding, quotechar=quotechar, engine="python")
-except Exception as e:
-    st.error(f"CSV read error: {e}")
-    st.stop()
-
-st.subheader("Input Preview")
-st.dataframe(df.head(int(preview_rows)), use_container_width=True)
-
-# Column mapping
-st.subheader("Column Mapping")
 cols = list(df.columns)
-m1, m2, m3 = st.columns(3)
-with m1:
-    col_key = st.selectbox("Issue Key column", cols, index=cols.index("Issue key") if "Issue key" in cols else 0)
-with m2:
-    col_summary = st.selectbox("Summary column", cols, index=cols.index("Summary") if "Summary" in cols else 0)
-with m3:
-    col_desc = st.selectbox("Description column", cols, index=cols.index("Description") if "Description" in cols else 0)
 
-run = st.button("Run BSDV_CLEAN_DEFECT", type="primary")
+key_col = pick_col(cols, ["issue key", "issue_key", "key"]) or cols[0]
+summary_col = pick_col(cols, ["summary", "title"]) or cols[0]
+desc_col = pick_col(cols, ["description"]) or cols[0]
+created_col = pick_col(cols, ["created", "created date", "created_at", "createdat"])
 
-if run:
-    safe_df, summary = detect_bsdv_clean_defect(
-        df=df,
-        key_col=col_key,
-        summary_col=col_summary,
-        desc_col=col_desc,
-        # LOCKED params live in function defaults
-    )
+st.write("Detected columns:")
+st.json(
+    {
+        "Issue Key": key_col,
+        "Summary/Title": summary_col,
+        "Description": desc_col,
+        "Created (optional)": created_col if created_col else "(not found)",
+    }
+)
 
-    # ---- Summary counts (DIRECT OUTPUT) ----
-    st.subheader("Summary (Direct Counts)")
-    # show as 4 metrics + a table
-    a, b, c, d = st.columns(4)
-    a.metric("Total issues", summary["Total issue count"])
-    b.metric("EXACT", summary["Exact duplicate count"])
-    c.metric("SEMANTIC", summary["Semantic duplicate count"])
-    d.metric("SAFE DELETE", summary["Safe delete total"])
-    st.table(pd.DataFrame([summary]))
+work = df.copy()
+work["_row"] = np.arange(len(work))
+work["_key"] = work[key_col].astype(str).str.strip()
+work["_norm"] = [normalize_text(a, b) for a, b in zip(work[summary_col], work[desc_col])]
+work["_tokens"] = work["_norm"].apply(tokenize)
+work["_set"] = work["_tokens"].apply(set)
 
-    # ---- SAFE Delete table ----
-    st.subheader("SAFE Delete List (Table)")
-    if len(safe_df) == 0:
-        st.write("No SAFE_DELETE items found.")
+created_dt = None
+if created_col:
+    created_dt = parse_created_series(work[created_col])
+
+# 1) EXACT (by normalized text identity)
+seen_norm = {}
+exact_pairs = []  # list of (keep_idx, delete_idx)
+exact_delete_idx = set()
+
+for i, nm in enumerate(work["_norm"]):
+    if not nm:
+        continue
+    if nm in seen_norm:
+        j = seen_norm[nm]
+        keep_idx, del_idx = determine_keep_delete(i, j, created_dt)
+        exact_pairs.append((keep_idx, del_idx))
+        exact_delete_idx.add(del_idx)
     else:
-        # deterministic ordering: show EXACT first, then SEMANTIC; inside, by Keep then Delete
-        safe_df_show = safe_df.copy()
-        safe_df_show["TypeOrder"] = safe_df_show["Type"].map({"EXACT": 0, "SEMANTIC": 1}).fillna(9)
-        safe_df_show = safe_df_show.sort_values(["TypeOrder", "Duplicate Of (Keep)", "Issue Key (Delete)"]).drop(columns=["TypeOrder"])
-        st.table(safe_df_show)
+        seen_norm[nm] = i
 
-        # Type breakdown (table)
-        st.subheader("Breakdown by Type")
-        breakdown = safe_df["Type"].value_counts().rename_axis("Type").reset_index(name="Count")
-        st.table(breakdown)
+# 2) SEMANTIC (>= 0.69) using inverted index to avoid O(n^2)
+inv = defaultdict(list)
+for i, s in enumerate(work["_set"]):
+    for t in s:
+        inv[t].append(i)
 
-    st.download_button(
-        "Download SAFE_DELETE_DEFECT.csv",
-        data=to_csv_bytes(safe_df),
-        file_name="SAFE_DELETE_DEFECT.csv",
-        mime="text/csv",
+semantic_pairs = []  # (keep_idx, delete_idx, score)
+semantic_delete_idx = set()
+
+seen_pair = set()
+
+for i, si in enumerate(work["_set"]):
+    if i in exact_delete_idx or i in semantic_delete_idx:
+        continue
+
+    # candidate generation
+    cand = set()
+    for t in si:
+        cand.update(inv[t])
+
+    for j in cand:
+        if j == i:
+            continue
+
+        # avoid duplicates
+        a, b = (j, i) if j < i else (i, j)
+        if (a, b) in seen_pair:
+            continue
+        seen_pair.add((a, b))
+
+        # compute
+        sj = work["_set"].iloc[j]
+        shared = len(si & sj)
+        if shared < MIN_SHARED_TOKENS:
+            continue
+
+        score = jaccard(si, sj)
+        if score < THRESH_MIN:
+            continue
+
+        keep_idx, del_idx = determine_keep_delete(i, j, created_dt)
+
+        # do not mark something as delete twice
+        if del_idx in exact_delete_idx or del_idx in semantic_delete_idx:
+            continue
+
+        semantic_pairs.append((keep_idx, del_idx, score))
+        semantic_delete_idx.add(del_idx)
+
+# Build combined output table
+rows = []
+
+for keep_idx, del_idx in exact_pairs:
+    rows.append(
+        {
+            "Issue Key (Keep)": work["_key"].iloc[keep_idx],
+            "Issue Key (Delete)": work["_key"].iloc[del_idx],
+            "Type": "EXACT",
+            "Similarity": 1.000,
+            "Decision": "SAFE_DELETE_STRICT",
+        }
     )
+
+for keep_idx, del_idx, score in semantic_pairs:
+    decision = "SAFE_DELETE_STRICT" if score >= THRESH_SAFE else "QA_REVIEW"
+    rows.append(
+        {
+            "Issue Key (Keep)": work["_key"].iloc[keep_idx],
+            "Issue Key (Delete)": work["_key"].iloc[del_idx],
+            "Type": "SEMANTIC",
+            "Similarity": round(float(score), 3),
+            "Decision": decision,
+        }
+    )
+
+out_df = pd.DataFrame(rows)
+
+if not out_df.empty:
+    # stable sort: SAFE_DELETE_STRICT first, then QA_REVIEW; then similarity desc
+    order = {"SAFE_DELETE_STRICT": 0, "QA_REVIEW": 1}
+    out_df["_ord"] = out_df["Decision"].map(order).fillna(9)
+    out_df = out_df.sort_values(["_ord", "Similarity"], ascending=[True, False]).drop(columns=["_ord"])
+
+# Summary
+total = len(work)
+exact_cnt = int((out_df["Type"] == "EXACT").sum()) if not out_df.empty else 0
+semantic_cnt = int((out_df["Type"] == "SEMANTIC").sum()) if not out_df.empty else 0
+safe_cnt = int((out_df["Decision"] == "SAFE_DELETE_STRICT").sum()) if not out_df.empty else 0
+review_cnt = int((out_df["Decision"] == "QA_REVIEW").sum()) if not out_df.empty else 0
+
+summary_df = pd.DataFrame(
+    [
+        {"Metric": "Total issue count", "Count": total},
+        {"Metric": "Exact duplicate count", "Count": exact_cnt},
+        {"Metric": "Semantic duplicate count (>=0.69)", "Count": semantic_cnt},
+        {"Metric": "SAFE_DELETE_STRICT (>=0.80)", "Count": safe_cnt},
+        {"Metric": "QA_REVIEW (0.69–0.79)", "Count": review_cnt},
+        {"Metric": "Total flagged (safe+review)", "Count": len(out_df)},
+    ]
+)
+
+# ----------------------------
+# Render
+# ----------------------------
+st.subheader("Summary")
+st.dataframe(summary_df, use_container_width=True, hide_index=True)
+
+st.subheader("Combined Output (SAFE_DELETE_STRICT + QA_REVIEW)")
+st.dataframe(out_df, use_container_width=True, hide_index=True)
+
+# Downloads
+csv_out = out_df.to_csv(index=False).encode("utf-8")
+csv_sum = summary_df.to_csv(index=False).encode("utf-8")
+
+st.download_button(
+    "Download Combined CSV",
+    data=csv_out,
+    file_name="BSDV_CLEAN_DEFECT_OUTPUT.csv",
+    mime="text/csv",
+)
+
+st.download_button(
+    "Download Summary CSV",
+    data=csv_sum,
+    file_name="BSDV_CLEAN_DEFECT_SUMMARY.csv",
+    mime="text/csv",
+)
+
+st.caption("Note: This tool is conservative; QA_REVIEW items should be manually validated for same root cause.")

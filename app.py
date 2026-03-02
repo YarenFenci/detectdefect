@@ -1,6 +1,32 @@
+# app.py
+# Duplicate Detection Pipeline (TF-IDF Candidates + BSDV Safe Delete + Optional Clustering)
+# -----------------------------------------------------------------------------
+# Config (as requested):
+# - Candidate Generation: TF-IDF cosine similarity, threshold >= 0.69
+# - SAFEDELETESTRICT: Jaccard >= 0.80 AND shared tokens >= 5
+# - Clustering: optional, connected components (graph) to group duplicates
+# - Output Columns:
+#     Issue Key (Keep), Issue Key (Delete), Duplicate Type, Similarity, Decision
+# - Goal: maximize candidate coverage while ensuring safe delete
+#
+# Notes:
+# - Uses Summary + Description (auto-detected column names)
+# - Ignores noisy parts (version/build/device/log/urls/numbers) via regex
+# - Deterministic KEEP selection:
+#     If Created exists and parseable: older KEEP
+#     Else: earlier row in file KEEP
+#
+# Run:
+#   streamlit run app.py
+#
+# requirements.txt (fast/stable):
+#   streamlit
+#   pandas
+#   numpy
+#   scikit-learn
 
 import re
-from collections import defaultdict
+from collections import defaultdict, deque
 from io import StringIO
 
 import numpy as np
@@ -9,14 +35,14 @@ import streamlit as st
 
 
 # ----------------------------
-# BSDV SAFE config (locked)
+# Pipeline config (locked)
 # ----------------------------
-BSDV_MIN_SHARED_TOKENS = 5
-BSDV_SAFE_JACCARD = 0.80  # SAFE_DELETE_STRICT semantic threshold (unchanged)
+CANDIDATE_COS_THRESHOLD = 0.69
 
-# QA (fast) defaults
-QA_COS_THRESHOLD_DEFAULT = 0.86
-QA_TOPK_DEFAULT = 10
+SAFE_JACCARD_THRESHOLD = 0.80
+SAFE_MIN_SHARED_TOKENS = 5
+
+TOP_K_NEIGHBORS = 20  # increases candidate coverage without NxN cost
 
 STOPWORDS = set(
     """
@@ -90,7 +116,7 @@ def determine_keep_delete(i, j, created_dt: pd.Series | None):
 
 
 @st.cache_data(show_spinner=False)
-def preprocess_df(raw_csv: str):
+def load_and_preprocess(raw_csv: str):
     df = pd.read_csv(StringIO(raw_csv), sep=None, engine="python", on_bad_lines="skip")
     cols = list(df.columns)
 
@@ -118,71 +144,82 @@ def preprocess_df(raw_csv: str):
 
 
 @st.cache_data(show_spinner=False)
-def tfidf_topk_neighbors(texts: list[str], topk: int):
+def tfidf_topk_candidates(texts: list[str], topk: int):
     """
-    TF-IDF vectors + NearestNeighbors(cosine)
+    Candidate generation with TF-IDF + NearestNeighbors(cosine).
     Returns:
-      indices: [n, topk]
-      sims:    [n, topk] cosine similarity
-      method label
+      nn_idx: [n, topk] neighbor indices
+      nn_sim: [n, topk] cosine similarity
     """
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.neighbors import NearestNeighbors
 
-    vec = TfidfVectorizer(min_df=2, ngram_range=(1, 2))
+    vec = TfidfVectorizer(min_df=1, ngram_range=(1, 2))
     X = vec.fit_transform(texts)
 
+    # brute is reliable for sparse; still fast for a few thousand items with top-k
     nn = NearestNeighbors(n_neighbors=topk + 1, metric="cosine", algorithm="brute")
     nn.fit(X)
 
     distances, indices = nn.kneighbors(X)
-    indices = indices[:, 1:]          # drop self
-    sims = 1.0 - distances[:, 1:]     # cosine sim = 1 - cosine distance
-    return indices, sims, "TF-IDF + NearestNeighbors(cosine) (ULTRA FAST)"
+    indices = indices[:, 1:]       # drop self
+    sims = 1.0 - distances[:, 1:]  # cosine similarity
+    return indices, sims
+
+
+def connected_components_from_edges(n: int, edges: list[tuple[int, int]]):
+    """
+    Undirected connected components.
+    Returns: list of components (each a sorted list of node indices).
+    """
+    adj = [[] for _ in range(n)]
+    for a, b in edges:
+        if a == b:
+            continue
+        adj[a].append(b)
+        adj[b].append(a)
+
+    seen = [False] * n
+    comps = []
+    for i in range(n):
+        if seen[i] or not adj[i]:
+            continue
+        q = deque([i])
+        seen[i] = True
+        comp = [i]
+        while q:
+            u = q.popleft()
+            for v in adj[u]:
+                if not seen[v]:
+                    seen[v] = True
+                    q.append(v)
+                    comp.append(v)
+        comps.append(sorted(comp))
+    return comps
 
 
 def main():
-    st.set_page_config(page_title="BSDV_CLEAN_DEFECT_HYBRID (ULTRA FAST)", layout="wide")
-    st.title("BSDV_CLEAN_DEFECT_HYBRID (ULTRA FAST)")
-    st.caption("SAFE_DELETE_STRICT = BSDV (unchanged), QA_REVIEW = TF-IDF cosine top-k neighbors.")
+    st.set_page_config(page_title="Duplicate Detection Pipeline", layout="wide")
+    st.title("Duplicate Detection Pipeline")
 
     uploaded = st.file_uploader("Upload defects CSV", type=["csv"])
-
-    with st.expander("Rules", expanded=False):
-        st.markdown(
-            f"""
-**SAFE_DELETE_STRICT (BSDV):**
-- EXACT: normalized text identical
-- SEMANTIC SAFE: shared tokens ≥ {BSDV_MIN_SHARED_TOKENS} AND Jaccard ≥ {BSDV_SAFE_JACCARD}
-
-**QA_REVIEW (ULTRA FAST):**
-- TF-IDF + NearestNeighbors(cosine)
-- cosine similarity ≥ threshold (default {QA_COS_THRESHOLD_DEFAULT})
-- only top-K neighbors per issue (default {QA_TOPK_DEFAULT})
-- excludes SAFE_DELETE_STRICT
-"""
-        )
-
-    run_qa = st.checkbox("Run QA_REVIEW (fast)", value=True)
-    qa_threshold = st.slider("QA_REVIEW cosine threshold", 0.70, 0.99, QA_COS_THRESHOLD_DEFAULT, 0.01)
-    qa_topk = st.slider("QA_REVIEW top-k neighbors", 3, 30, QA_TOPK_DEFAULT, 1)
-
     if not uploaded:
         st.stop()
 
     raw = uploaded.getvalue().decode("utf-8", errors="replace")
-    work, created_dt, detected = preprocess_df(raw)
+    work, created_dt, detected = load_and_preprocess(raw)
 
     st.write("Detected columns:")
     st.json(detected)
 
+    enable_clustering = st.checkbox("Enable clustering (connected components)", value=False)
+
     # ----------------------------
-    # SAFE_DELETE_STRICT (BSDV)
+    # EXACT duplicates (normalized text)
     # ----------------------------
-    # EXACT
     seen_norm = {}
-    exact_pairs = []
-    exact_delete_idx = set()
+    exact_pairs = []          # (keep_idx, delete_idx)
+    exact_delete_idx = set()  # to avoid cascading deletes
 
     for i, nm in enumerate(work["_norm"]):
         if not nm:
@@ -195,86 +232,40 @@ def main():
         else:
             seen_norm[nm] = i
 
-    # token inverted index for semantic SAFE
-    inv = defaultdict(list)
-    for i, s in enumerate(work["_set"]):
-        for t in s:
-            inv[t].append(i)
+    # ----------------------------
+    # Candidate generation (TF-IDF cosine >= 0.69)
+    # ----------------------------
+    with st.spinner("Generating candidates with TF-IDF cosine (top-k neighbors)..."):
+        nn_idx, nn_sim = tfidf_topk_candidates(work["_norm"].tolist(), TOP_K_NEIGHBORS)
 
-    safe_semantic_pairs = []
-    safe_semantic_delete_idx = set()
-    seen_pair = set()
+    # Build candidate pairs (deduped)
+    cand_best = {}  # (min_i,max_i) -> best cosine
+    for i in range(len(work)):
+        for pos in range(nn_idx.shape[1]):
+            j = int(nn_idx[i, pos])
+            score = float(nn_sim[i, pos])
 
-    for i, si in enumerate(work["_set"]):
-        if i in exact_delete_idx or i in safe_semantic_delete_idx:
-            continue
-
-        candidates = set()
-        for t in si:
-            candidates.update(inv[t])
-
-        for j in candidates:
-            if j == i:
-                continue
-            a, b = (j, i) if j < i else (i, j)
-            if (a, b) in seen_pair:
-                continue
-            seen_pair.add((a, b))
-
-            sj = work["_set"].iloc[j]
-            if len(si & sj) < BSDV_MIN_SHARED_TOKENS:
+            if score < CANDIDATE_COS_THRESHOLD:
                 continue
 
-            score = jaccard(si, sj)
-            if score >= BSDV_SAFE_JACCARD:
-                keep_idx, del_idx = determine_keep_delete(i, j, created_dt)
-                if del_idx in exact_delete_idx or del_idx in safe_semantic_delete_idx:
-                    continue
-                safe_semantic_pairs.append((keep_idx, del_idx, score))
-                safe_semantic_delete_idx.add(del_idx)
+            a, b = (i, j) if i < j else (j, i)
+            if a == b:
+                continue
+            if (a, b) not in cand_best or score > cand_best[(a, b)]:
+                cand_best[(a, b)] = score
 
-    safe_delete_set = set([d for _, d in exact_pairs] + [d for _, d, _ in safe_semantic_pairs])
-
-    # ----------------------------
-    # QA_REVIEW (TF-IDF top-k)
-    # ----------------------------
-    qa_pairs = []
-    qa_method = "disabled"
-
-    if run_qa:
-        with st.spinner("Finding QA_REVIEW candidates (TF-IDF top-k neighbors)..."):
-            nn_idx, nn_sim, qa_method = tfidf_topk_neighbors(work["_norm"].tolist(), qa_topk)
-
-        qa_candidate_rows = []
-        for i in range(len(work)):
-            for pos in range(nn_idx.shape[1]):
-                j = int(nn_idx[i, pos])
-                score = float(nn_sim[i, pos])
-
-                if score < qa_threshold:
-                    continue
-
-                keep_idx, del_idx = determine_keep_delete(i, j, created_dt)
-                if del_idx in safe_delete_set:
-                    continue
-
-                pair = (min(keep_idx, del_idx), max(keep_idx, del_idx))
-                qa_candidate_rows.append((keep_idx, del_idx, score, pair))
-
-        # keep best score per pair
-        best = {}
-        for keep_idx, del_idx, score, pair in qa_candidate_rows:
-            if pair not in best or score > best[pair][2]:
-                best[pair] = (keep_idx, del_idx, score)
-
-        qa_pairs = list(best.values())
-        qa_pairs.sort(key=lambda x: x[2], reverse=True)
+    candidate_pairs = [(a, b, cand_best[(a, b)]) for (a, b) in cand_best.keys()]
+    candidate_pairs.sort(key=lambda x: x[2], reverse=True)
 
     # ----------------------------
-    # Combined Output
+    # Decision: SAFEDELETESTRICT vs QA_REVIEW
     # ----------------------------
     rows = []
 
+    # Track SAFE deletes to prevent multiple deletes of same issue (deterministic)
+    safe_deleted = set(exact_delete_idx)
+
+    # EXACT => SAFEDELETESTRICT
     for keep_idx, del_idx in exact_pairs:
         rows.append(
             {
@@ -282,73 +273,138 @@ def main():
                 "Issue Key (Delete)": work["_key"].iloc[del_idx],
                 "Duplicate Type": "EXACT",
                 "Similarity": 1.000,
-                "Decision": "SAFE_DELETE_STRICT",
-                "Method": "BSDV exact",
+                "Decision": "SAFEDELETESTRICT",
             }
         )
 
-    for keep_idx, del_idx, score in safe_semantic_pairs:
+    # SEMANTIC candidates: if safe condition met -> SAFEDELETESTRICT else QA_REVIEW
+    # Important: we DO NOT auto-safe-delete based on cosine; cosine is only for candidate coverage.
+    for a, b, cos_sim in candidate_pairs:
+        # don't try to delete something already marked exact delete
+        keep_idx, del_idx = determine_keep_delete(a, b, created_dt)
+        if del_idx in safe_deleted:
+            continue
+
+        sa = work["_set"].iloc[keep_idx]
+        sb = work["_set"].iloc[del_idx]
+        shared = len(sa & sb)
+        jac = jaccard(sa, sb)
+
+        if shared >= SAFE_MIN_SHARED_TOKENS and jac >= SAFE_JACCARD_THRESHOLD:
+            decision = "SAFEDELETESTRICT"
+            dup_type = "SEMANTIC"
+            sim_out = jac  # report Jaccard as similarity for SAFE (consistent with BSDV safety)
+            safe_deleted.add(del_idx)
+        else:
+            decision = "QA_REVIEW"
+            dup_type = "SEMANTIC"
+            sim_out = cos_sim  # report cosine for review prioritization
+
         rows.append(
             {
                 "Issue Key (Keep)": work["_key"].iloc[keep_idx],
                 "Issue Key (Delete)": work["_key"].iloc[del_idx],
-                "Duplicate Type": "SEMANTIC",
-                "Similarity": round(float(score), 3),
-                "Decision": "SAFE_DELETE_STRICT",
-                "Method": "BSDV semantic (Jaccard)",
-            }
-        )
-
-    for keep_idx, del_idx, score in qa_pairs:
-        rows.append(
-            {
-                "Issue Key (Keep)": work["_key"].iloc[keep_idx],
-                "Issue Key (Delete)": work["_key"].iloc[del_idx],
-                "Duplicate Type": "SEMANTIC",
-                "Similarity": round(float(score), 3),
-                "Decision": "QA_REVIEW",
-                "Method": qa_method,
+                "Duplicate Type": dup_type,
+                "Similarity": round(float(sim_out), 3),
+                "Decision": decision,
             }
         )
 
     out_df = pd.DataFrame(rows)
+
+    # Stable ordering: SAFE first, then QA_REVIEW; within, higher similarity first
     if not out_df.empty:
-        order = {"SAFE_DELETE_STRICT": 0, "QA_REVIEW": 1}
+        order = {"SAFEDELETESTRICT": 0, "QA_REVIEW": 1}
         out_df["_ord"] = out_df["Decision"].map(order).fillna(9)
         out_df = out_df.sort_values(["_ord", "Similarity"], ascending=[True, False]).drop(columns=["_ord"])
 
+    # ----------------------------
+    # Optional clustering (connected components)
+    # ----------------------------
+    cluster_df = None
+    if enable_clustering and not out_df.empty:
+        # cluster edges based on ALL flagged pairs (safe + review)
+        # Use original indices by mapping keys back to indices
+        key_to_idx = {k: i for i, k in enumerate(work["_key"].tolist())}
+
+        edges = []
+        for _, r in out_df.iterrows():
+            ki = key_to_idx.get(r["Issue Key (Keep)"])
+            kd = key_to_idx.get(r["Issue Key (Delete)"])
+            if ki is None or kd is None:
+                continue
+            a, b = (ki, kd) if ki < kd else (kd, ki)
+            edges.append((a, b))
+
+        comps = connected_components_from_edges(len(work), edges)
+
+        # represent each component as: cluster_id, size, keep_keys, members
+        # keep = deterministic: oldest by created else smallest index
+        cluster_rows = []
+        for cid, comp in enumerate(comps, start=1):
+            # pick keep idx
+            keep_idx = comp[0]
+            if created_dt is not None:
+                # choose oldest created among parseable, else fallback to smallest index
+                comp_created = [(i, created_dt.iloc[i]) for i in comp if pd.notna(created_dt.iloc[i])]
+                if comp_created:
+                    keep_idx = sorted(comp_created, key=lambda x: x[1])[0][0]
+            keep_key = work["_key"].iloc[keep_idx]
+            members = [work["_key"].iloc[i] for i in comp]
+            cluster_rows.append(
+                {
+                    "Cluster": cid,
+                    "Size": len(comp),
+                    "Keep": keep_key,
+                    "Members": ", ".join(members),
+                }
+            )
+        cluster_df = pd.DataFrame(cluster_rows).sort_values(["Size", "Cluster"], ascending=[False, True])
+
+    # ----------------------------
+    # Summary
+    # ----------------------------
+    total = len(work)
+    exact_cnt = int((out_df["Duplicate Type"] == "EXACT").sum()) if not out_df.empty else 0
+    safe_cnt = int((out_df["Decision"] == "SAFEDELETESTRICT").sum()) if not out_df.empty else 0
+    review_cnt = int((out_df["Decision"] == "QA_REVIEW").sum()) if not out_df.empty else 0
+
     summary_df = pd.DataFrame(
         [
-            {"Metric": "Total issue count", "Count": len(work)},
-            {"Metric": "SAFE_DELETE_STRICT", "Count": int((out_df["Decision"] == "SAFE_DELETE_STRICT").sum()) if not out_df.empty else 0},
-            {"Metric": "QA_REVIEW", "Count": int((out_df["Decision"] == "QA_REVIEW").sum()) if not out_df.empty else 0},
-            {"Metric": "QA_REVIEW method", "Count": qa_method},
-            {"Metric": "QA_REVIEW cosine threshold", "Count": qa_threshold if run_qa else "-"},
-            {"Metric": "QA_REVIEW top-k", "Count": qa_topk if run_qa else "-"},
+            {"Metric": "Total issue count", "Count": total},
+            {"Metric": "Candidate cosine threshold", "Count": CANDIDATE_COS_THRESHOLD},
+            {"Metric": "SAFEDELETESTRICT (Jaccard threshold)", "Count": SAFE_JACCARD_THRESHOLD},
+            {"Metric": "SAFEDELETESTRICT (min shared tokens)", "Count": SAFE_MIN_SHARED_TOKENS},
+            {"Metric": "Top-K neighbors per issue", "Count": TOP_K_NEIGHBORS},
+            {"Metric": "EXACT duplicates", "Count": exact_cnt},
+            {"Metric": "SAFEDELETESTRICT total", "Count": safe_cnt},
+            {"Metric": "QA_REVIEW total", "Count": review_cnt},
+            {"Metric": "Total flagged (safe+review)", "Count": len(out_df)},
         ]
     )
 
     st.subheader("Summary")
     st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
-    st.subheader("Combined Output")
+    st.subheader("Output")
     st.dataframe(out_df, use_container_width=True, hide_index=True)
 
     st.download_button(
-        "Download Combined CSV",
+        "Download Output CSV",
         data=out_df.to_csv(index=False).encode("utf-8"),
-        file_name="BSDV_CLEAN_DEFECT_HYBRID_ULTRAFAST_OUTPUT.csv",
+        file_name="DUPLICATE_PIPELINE_OUTPUT.csv",
         mime="text/csv",
     )
 
-    st.download_button(
-        "Download Summary CSV",
-        data=summary_df.to_csv(index=False).encode("utf-8"),
-        file_name="BSDV_CLEAN_DEFECT_HYBRID_ULTRAFAST_SUMMARY.csv",
-        mime="text/csv",
-    )
-
-    st.caption("QA_REVIEW items must be validated for same root cause before deletion.")
+    if cluster_df is not None:
+        st.subheader("Clusters (Connected Components)")
+        st.dataframe(cluster_df, use_container_width=True, hide_index=True)
+        st.download_button(
+            "Download Clusters CSV",
+            data=cluster_df.to_csv(index=False).encode("utf-8"),
+            file_name="DUPLICATE_PIPELINE_CLUSTERS.csv",
+            mime="text/csv",
+        )
 
 
 if __name__ == "__main__":

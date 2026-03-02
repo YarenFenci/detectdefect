@@ -1,3 +1,21 @@
+# app.py
+# BSDV_CLEAN_DEFECT_HYBRID (FAST - Nearest Neighbors)
+# ------------------------------------------------------------
+# SAFE_DELETE_STRICT: BSDV (UNCHANGED)
+#   - EXACT: normalized text identical  -> SAFE_DELETE_STRICT
+#   - SEMANTIC SAFE: shared tokens >=5 AND Jaccard >=0.80 -> SAFE_DELETE_STRICT
+#
+# QA_REVIEW: FAST candidate generation using Top-K Nearest Neighbors (cosine)
+#   - sentence-transformers embeddings if available, else TF-IDF fallback
+#   - threshold slider applies on cosine similarity
+#   - excludes anything already marked SAFE_DELETE_STRICT
+#
+# Output: single combined table:
+#   Issue Key (Keep), Issue Key (Delete), Duplicate Type, Similarity, Decision, Method
+#
+# Run:
+#   streamlit run app.py
+
 import re
 from collections import defaultdict
 from io import StringIO
@@ -7,21 +25,13 @@ import pandas as pd
 import streamlit as st
 
 
-# =========================
-# BSDV_CLEAN_DEFECT_HYBRID
-# =========================
-# SAFE_DELETE_STRICT: BSDV (EXACT + Jaccard>=0.80 with shared>=5)
-# QA_REVIEW: cosine similarity using sentence-transformers if available, else TF-IDF fallback
-#
-# Output: single table with:
-#   Issue Key (Keep), Issue Key (Delete), Duplicate Type, Similarity, Decision, Method
-
-
-# ---- Locked config (BSDV SAFE remains same) ----
+# ----------------------------
+# Locked config (BSDV SAFE stays same)
+# ----------------------------
 BSDV_MIN_SHARED_TOKENS = 5
 BSDV_SAFE_JACCARD = 0.80  # SAFE_DELETE_STRICT semantic threshold (unchanged)
 
-# ---- Hybrid QA defaults (can be tuned via UI) ----
+# Hybrid QA defaults
 QA_COS_THRESHOLD_DEFAULT = 0.86
 QA_TOPK_DEFAULT = 10
 
@@ -45,6 +55,9 @@ IGNORE_REGEXES = [
 ]
 
 
+# ----------------------------
+# Helpers
+# ----------------------------
 def pick_col(cols, must_contain_any):
     for c in cols:
         cl = c.lower().strip()
@@ -95,36 +108,82 @@ def determine_keep_delete(i, j, created_dt: pd.Series | None):
 
 @st.cache_resource(show_spinner=False)
 def load_embedding_model():
-    # Cached across reruns
     from sentence_transformers import SentenceTransformer
+
     return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
 
 
 @st.cache_data(show_spinner=False)
-def cosine_matrix(texts: list[str]):
+def topk_neighbors(texts: list[str], topk: int):
     """
-    Returns (sims_matrix, method_label).
-    Prefers sentence-transformers; TF-IDF fallback if model unavailable.
+    Returns:
+      indices: [n, topk] neighbor indices
+      sims:    [n, topk] cosine similarity
+      method:  label
+    Prefers embeddings; falls back to TF-IDF.
     """
     try:
-        from sklearn.metrics.pairwise import cosine_similarity
+        from sklearn.neighbors import NearestNeighbors
+
         model = load_embedding_model()
         emb = model.encode(texts, show_progress_bar=False, normalize_embeddings=True)
-        sims = cosine_similarity(emb)
-        return sims, "sentence-transformers/all-MiniLM-L6-v2"
+
+        nn = NearestNeighbors(n_neighbors=topk + 1, metric="cosine", algorithm="auto")
+        nn.fit(emb)
+        distances, indices = nn.kneighbors(emb)  # cosine distance = 1 - cosine sim
+
+        # drop self (first neighbor)
+        indices = indices[:, 1:]
+        sims = 1.0 - distances[:, 1:]
+        return indices, sims, "sentence-transformers + NearestNeighbors(cosine)"
     except Exception:
         from sklearn.feature_extraction.text import TfidfVectorizer
-        from sklearn.metrics.pairwise import cosine_similarity
+        from sklearn.neighbors import NearestNeighbors
+
         vec = TfidfVectorizer(min_df=2, ngram_range=(1, 2))
         X = vec.fit_transform(texts)
-        sims = cosine_similarity(X)
-        return sims, "TF-IDF cosine (fallback)"
+
+        nn = NearestNeighbors(n_neighbors=topk + 1, metric="cosine", algorithm="brute")
+        nn.fit(X)
+        distances, indices = nn.kneighbors(X)
+
+        indices = indices[:, 1:]
+        sims = 1.0 - distances[:, 1:]
+        return indices, sims, "TF-IDF + NearestNeighbors(cosine) (fallback)"
+
+
+@st.cache_data(show_spinner=False)
+def preprocess_df(raw_csv: str):
+    df = pd.read_csv(StringIO(raw_csv), sep=None, engine="python", on_bad_lines="skip")
+    cols = list(df.columns)
+
+    key_col = pick_col(cols, ["issue key", "issue_key", "key"]) or cols[0]
+    summary_col = pick_col(cols, ["summary", "title"]) or cols[0]
+    desc_col = pick_col(cols, ["description"]) or cols[0]
+    created_col = pick_col(cols, ["created", "created date", "created_at", "createdat"])
+
+    work = df.copy()
+    work["_key"] = work[key_col].astype(str).str.strip()
+    work["_norm"] = [normalize_text(a, b) for a, b in zip(work[summary_col], work[desc_col])]
+    work["_set"] = work["_norm"].apply(lambda x: set(tokenize(x)))
+
+    created_dt = None
+    if created_col:
+        created_dt = parse_created(work[created_col])
+
+    detected = {
+        "Issue Key": key_col,
+        "Summary/Title": summary_col,
+        "Description": desc_col,
+        "Created (optional)": created_col if created_col else "(not found)",
+    }
+    return df, work, created_dt, detected
 
 
 def main():
-    st.set_page_config(page_title="BSDV_CLEAN_DEFECT_HYBRID", layout="wide")
-    st.title("BSDV_CLEAN_DEFECT_HYBRID")
-    st.caption("SAFE_DELETE_STRICT = BSDV (unchanged), QA_REVIEW = cosine candidates (embedding if available).")
+    st.set_page_config(page_title="BSDV_CLEAN_DEFECT_HYBRID (FAST)", layout="wide")
+    st.title("BSDV_CLEAN_DEFECT_HYBRID (FAST)")
+    st.caption("SAFE_DELETE_STRICT = BSDV (unchanged), QA_REVIEW = top-k cosine neighbors (fast).")
 
     uploaded = st.file_uploader("Upload defects CSV", type=["csv"])
 
@@ -135,13 +194,14 @@ def main():
 - EXACT: normalized text identical
 - SEMANTIC SAFE: shared tokens ≥ {BSDV_MIN_SHARED_TOKENS} AND Jaccard ≥ {BSDV_SAFE_JACCARD}
 
-**QA_REVIEW (Hybrid):**
+**QA_REVIEW (Hybrid FAST):**
+- Top-K cosine neighbors (no NxN matrix)
 - cosine similarity ≥ threshold (default {QA_COS_THRESHOLD_DEFAULT})
-- only top-K neighbors per issue (default {QA_TOPK_DEFAULT})
 - excludes anything already marked SAFE_DELETE_STRICT
 """
         )
 
+    run_qa = st.checkbox("Run QA_REVIEW (cosine neighbors)", value=True)
     qa_threshold = st.slider("QA_REVIEW cosine threshold", 0.70, 0.99, QA_COS_THRESHOLD_DEFAULT, 0.01)
     qa_topk = st.slider("QA_REVIEW top-k neighbors", 3, 30, QA_TOPK_DEFAULT, 1)
 
@@ -149,32 +209,11 @@ def main():
         st.stop()
 
     raw = uploaded.getvalue().decode("utf-8", errors="replace")
-    df = pd.read_csv(StringIO(raw), sep=None, engine="python", on_bad_lines="skip")
 
-    cols = list(df.columns)
-    key_col = pick_col(cols, ["issue key", "issue_key", "key"]) or cols[0]
-    summary_col = pick_col(cols, ["summary", "title"]) or cols[0]
-    desc_col = pick_col(cols, ["description"]) or cols[0]
-    created_col = pick_col(cols, ["created", "created date", "created_at", "createdat"])
+    df, work, created_dt, detected = preprocess_df(raw)
 
     st.write("Detected columns:")
-    st.json(
-        {
-            "Issue Key": key_col,
-            "Summary/Title": summary_col,
-            "Description": desc_col,
-            "Created (optional)": created_col if created_col else "(not found)",
-        }
-    )
-
-    work = df.copy()
-    work["_key"] = work[key_col].astype(str).str.strip()
-    work["_norm"] = [normalize_text(a, b) for a, b in zip(work[summary_col], work[desc_col])]
-    work["_set"] = work["_norm"].apply(lambda x: set(tokenize(x)))
-
-    created_dt = None
-    if created_col:
-        created_dt = parse_created(work[created_col])
+    st.json(detected)
 
     # ----------------------------
     # SAFE_DELETE_STRICT (BSDV)
@@ -195,7 +234,7 @@ def main():
         else:
             seen_norm[nm] = i
 
-    # inverted index for semantic SAFE candidates
+    # token inverted index for semantic SAFE
     inv = defaultdict(list)
     for i, s in enumerate(work["_set"]):
         for t in s:
@@ -236,39 +275,42 @@ def main():
     safe_delete_set = set([d for _, d in exact_pairs] + [d for _, d, _ in safe_semantic_pairs])
 
     # ----------------------------
-    # QA_REVIEW (cosine)
+    # QA_REVIEW (FAST top-k)
     # ----------------------------
-    with st.spinner("Computing cosine similarity for QA_REVIEW candidates..."):
-        sims, qa_method = cosine_matrix(work["_norm"].tolist())
+    qa_pairs = []
+    qa_method = "disabled"
 
-    qa_candidate_rows = []
-    for i in range(len(work)):
-        sim_row = sims[i].copy()
-        sim_row[i] = -1.0
-        top_idx = np.argsort(sim_row)[::-1][:qa_topk]
+    if run_qa:
+        with st.spinner("Finding QA_REVIEW candidates (top-k cosine neighbors)..."):
+            nn_idx, nn_sim, qa_method = topk_neighbors(work["_norm"].tolist(), qa_topk)
 
-        for j in top_idx:
-            score = float(sim_row[j])
-            if score < qa_threshold:
-                break
+        qa_candidate_rows = []
+        for i in range(len(work)):
+            for pos in range(nn_idx.shape[1]):
+                j = int(nn_idx[i, pos])
+                score = float(nn_sim[i, pos])
 
-            keep_idx, del_idx = determine_keep_delete(i, j, created_dt)
-            if del_idx in safe_delete_set:
-                continue
+                if score < qa_threshold:
+                    continue
 
-            pair = (min(keep_idx, del_idx), max(keep_idx, del_idx))
-            qa_candidate_rows.append((keep_idx, del_idx, score, pair))
+                keep_idx, del_idx = determine_keep_delete(i, j, created_dt)
+                if del_idx in safe_delete_set:
+                    continue
 
-    best = {}
-    for keep_idx, del_idx, score, pair in qa_candidate_rows:
-        if pair not in best or score > best[pair][2]:
-            best[pair] = (keep_idx, del_idx, score)
+                pair = (min(keep_idx, del_idx), max(keep_idx, del_idx))
+                qa_candidate_rows.append((keep_idx, del_idx, score, pair))
 
-    qa_pairs = list(best.values())
-    qa_pairs.sort(key=lambda x: x[2], reverse=True)
+        # keep best score per pair
+        best = {}
+        for keep_idx, del_idx, score, pair in qa_candidate_rows:
+            if pair not in best or score > best[pair][2]:
+                best[pair] = (keep_idx, del_idx, score)
+
+        qa_pairs = list(best.values())
+        qa_pairs.sort(key=lambda x: x[2], reverse=True)
 
     # ----------------------------
-    # Combined output
+    # Combined Output
     # ----------------------------
     rows = []
 
@@ -320,8 +362,8 @@ def main():
             {"Metric": "SAFE_DELETE_STRICT", "Count": int((out_df["Decision"] == "SAFE_DELETE_STRICT").sum()) if not out_df.empty else 0},
             {"Metric": "QA_REVIEW", "Count": int((out_df["Decision"] == "QA_REVIEW").sum()) if not out_df.empty else 0},
             {"Metric": "QA_REVIEW method", "Count": qa_method},
-            {"Metric": "QA_REVIEW cosine threshold", "Count": qa_threshold},
-            {"Metric": "QA_REVIEW top-k", "Count": qa_topk},
+            {"Metric": "QA_REVIEW cosine threshold", "Count": qa_threshold if run_qa else "-"},
+            {"Metric": "QA_REVIEW top-k", "Count": qa_topk if run_qa else "-"},
         ]
     )
 

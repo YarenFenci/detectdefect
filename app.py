@@ -1,8 +1,9 @@
 
 
 import re
-from collections import defaultdict, deque
+from collections import deque
 from io import StringIO
+from typing import Dict, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -10,15 +11,14 @@ import streamlit as st
 
 
 # ----------------------------
-# Pipeline config (locked)
+# Locked Production Config
 # ----------------------------
 CANDIDATE_COS_THRESHOLD = 0.69
-TOP_K_NEIGHBORS = 20  # coverage knob (higher = more candidates)
+TOP_K_NEIGHBORS = 20  # increase for higher recall; keep moderate for speed
 
-# Updated SAFEDELETESTRICT rule
 SAFE_JACCARD_THRESHOLD = 0.75
 SAFE_MIN_SHARED_TOKENS = 5
-SAFE_COSINE_OVERRIDE = 0.92  # OR condition
+SAFE_COSINE_OVERRIDE = 0.92
 
 STOPWORDS = set(
     """
@@ -41,9 +41,9 @@ IGNORE_REGEXES = [
 
 
 # ----------------------------
-# Helpers
+# Text / similarity helpers
 # ----------------------------
-def pick_col(cols, must_contain_any):
+def pick_col(cols: List[str], must_contain_any: List[str]) -> Optional[str]:
     for c in cols:
         cl = c.lower().strip()
         if any(k in cl for k in must_contain_any):
@@ -61,7 +61,7 @@ def normalize_text(summary, desc) -> str:
     return s
 
 
-def tokenize(norm: str):
+def tokenize(norm: str) -> List[str]:
     toks = []
     for t in norm.split():
         if len(t) < 3:
@@ -72,7 +72,7 @@ def tokenize(norm: str):
     return toks
 
 
-def jaccard(a_set: set, b_set: set) -> float:
+def jaccard(a_set: Set[str], b_set: Set[str]) -> float:
     if not a_set or not b_set:
         return 0.0
     return len(a_set & b_set) / len(a_set | b_set)
@@ -82,8 +82,10 @@ def parse_created(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, errors="coerce", utc=False)
 
 
-def determine_keep_delete(i, j, created_dt: pd.Series | None):
-    # older KEEP if possible, else earlier row KEEP
+def determine_keep_delete(i: int, j: int, created_dt: Optional[pd.Series]) -> Tuple[int, int]:
+    # Deterministic KEEP:
+    # - older created date KEEP, if both parseable
+    # - else earlier row KEEP
     if created_dt is not None:
         ci, cj = created_dt.iloc[i], created_dt.iloc[j]
         if pd.notna(ci) and pd.notna(cj):
@@ -91,6 +93,9 @@ def determine_keep_delete(i, j, created_dt: pd.Series | None):
     return (i, j) if i < j else (j, i)
 
 
+# ----------------------------
+# Data prep / TF-IDF neighbors
+# ----------------------------
 @st.cache_data(show_spinner=False)
 def load_and_preprocess(raw_csv: str):
     df = pd.read_csv(StringIO(raw_csv), sep=None, engine="python", on_bad_lines="skip")
@@ -120,9 +125,9 @@ def load_and_preprocess(raw_csv: str):
 
 
 @st.cache_data(show_spinner=False)
-def tfidf_topk_candidates(texts: list[str], topk: int):
+def tfidf_topk_neighbors(texts: List[str], topk: int):
     """
-    Candidate generation with TF-IDF + NearestNeighbors(cosine).
+    TF-IDF vectors + NearestNeighbors(cosine).
     Returns:
       nn_idx: [n, topk] neighbor indices
       nn_sim: [n, topk] cosine similarity
@@ -133,7 +138,7 @@ def tfidf_topk_candidates(texts: list[str], topk: int):
     vec = TfidfVectorizer(min_df=1, ngram_range=(1, 2))
     X = vec.fit_transform(texts)
 
-    nn = NearestNeighbors(n_neighbors=topk + 1, metric="cosine", algorithm="brute")
+    nn = NearestNeighbors(n_neighbors=min(topk + 1, X.shape[0]), metric="cosine", algorithm="brute")
     nn.fit(X)
 
     distances, indices = nn.kneighbors(X)
@@ -142,7 +147,11 @@ def tfidf_topk_candidates(texts: list[str], topk: int):
     return indices, sims
 
 
-def connected_components_from_edges(n: int, edges: list[tuple[int, int]]):
+def connected_components_from_edges(n: int, edges: List[Tuple[int, int]]) -> List[List[int]]:
+    """
+    Undirected connected components from edge list.
+    Only returns components with size >= 2.
+    """
     adj = [[] for _ in range(n)]
     for a, b in edges:
         if a == b:
@@ -165,32 +174,21 @@ def connected_components_from_edges(n: int, edges: list[tuple[int, int]]):
                     seen[v] = True
                     q.append(v)
                     comp.append(v)
-        comps.append(sorted(comp))
+        if len(comp) >= 2:
+            comps.append(sorted(comp))
     return comps
 
 
-def main():
-    st.set_page_config(page_title="Duplicate Detection Pipeline", layout="wide")
-    st.title("Duplicate Detection Pipeline")
+# ----------------------------
+# Core pipeline
+# ----------------------------
+def run_pipeline(work: pd.DataFrame, created_dt: Optional[pd.Series], enable_clustering: bool):
+    n = len(work)
 
-    uploaded = st.file_uploader("Upload defects CSV", type=["csv"])
-    if not uploaded:
-        st.stop()
-
-    raw = uploaded.getvalue().decode("utf-8", errors="replace")
-    work, created_dt, detected = load_and_preprocess(raw)
-
-    st.write("Detected columns:")
-    st.json(detected)
-
-    enable_clustering = st.checkbox("Enable clustering (connected components)", value=False)
-
-    # ----------------------------
-    # EXACT duplicates (normalized text)
-    # ----------------------------
-    seen_norm = {}
-    exact_pairs = []
-    exact_delete_idx = set()
+    # 1) EXACT duplicates: normalized text identical
+    seen_norm: Dict[str, int] = {}
+    exact_pairs: List[Tuple[int, int]] = []
+    exact_deleted: Set[int] = set()
 
     for i, nm in enumerate(work["_norm"]):
         if not nm:
@@ -199,41 +197,35 @@ def main():
             j = seen_norm[nm]
             keep_idx, del_idx = determine_keep_delete(i, j, created_dt)
             exact_pairs.append((keep_idx, del_idx))
-            exact_delete_idx.add(del_idx)
+            exact_deleted.add(del_idx)
         else:
             seen_norm[nm] = i
 
-    # ----------------------------
-    # Candidate generation (TF-IDF cosine >= 0.69)
-    # ----------------------------
-    with st.spinner("Generating candidates with TF-IDF cosine (top-k neighbors)..."):
-        nn_idx, nn_sim = tfidf_topk_candidates(work["_norm"].tolist(), TOP_K_NEIGHBORS)
+    # 2) Candidate generation via TF-IDF cosine (top-k) >= 0.69
+    nn_idx, nn_sim = tfidf_topk_neighbors(work["_norm"].tolist(), TOP_K_NEIGHBORS)
 
-    cand_best = {}  # (min_i,max_i) -> best cosine
-    for i in range(len(work)):
+    # Deduplicate candidate pairs, keep best cosine per pair
+    cand_best: Dict[Tuple[int, int], float] = {}
+    for i in range(n):
         for pos in range(nn_idx.shape[1]):
             j = int(nn_idx[i, pos])
-            score = float(nn_sim[i, pos])
-
-            if score < CANDIDATE_COS_THRESHOLD:
+            cos = float(nn_sim[i, pos])
+            if cos < CANDIDATE_COS_THRESHOLD:
                 continue
-
             a, b = (i, j) if i < j else (j, i)
             if a == b:
                 continue
-            if (a, b) not in cand_best or score > cand_best[(a, b)]:
-                cand_best[(a, b)] = score
+            if (a, b) not in cand_best or cos > cand_best[(a, b)]:
+                cand_best[(a, b)] = cos
 
     candidate_pairs = [(a, b, cand_best[(a, b)]) for (a, b) in cand_best.keys()]
     candidate_pairs.sort(key=lambda x: x[2], reverse=True)
 
-    # ----------------------------
-    # Decision: SAFEDELETESTRICT vs QA_REVIEW
-    # ----------------------------
-    rows = []
+    # 3) Classify candidates into SAFEDELETESTRICT or QA_REVIEW
+    rows: List[Dict] = []
 
-    # Deterministic: prevent multiple deletes of same issue
-    safe_deleted = set(exact_delete_idx)
+    # Deterministic: avoid deleting same issue multiple times
+    safe_deleted: Set[int] = set(exact_deleted)
 
     # EXACT -> SAFEDELETESTRICT
     for keep_idx, del_idx in exact_pairs:
@@ -247,7 +239,7 @@ def main():
             }
         )
 
-    for a, b, cos_sim in candidate_pairs:
+    for a, b, cos in candidate_pairs:
         keep_idx, del_idx = determine_keep_delete(a, b, created_dt)
         if del_idx in safe_deleted:
             continue
@@ -257,20 +249,19 @@ def main():
         shared = len(sa & sb)
         jac = jaccard(sa, sb)
 
-        # Updated rule:
-        # SAFE if (jac>=0.75 AND shared>=5) OR (cos>=0.92)
-        is_safe = ((shared >= SAFE_MIN_SHARED_TOKENS and jac >= SAFE_JACCARD_THRESHOLD) or (cos_sim >= SAFE_COSINE_OVERRIDE))
+        # SAFEDELETESTRICT rule:
+        is_safe = ((shared >= SAFE_MIN_SHARED_TOKENS and jac >= SAFE_JACCARD_THRESHOLD) or (cos >= SAFE_COSINE_OVERRIDE))
 
         if is_safe:
             decision = "SAFEDELETESTRICT"
             dup_type = "SEMANTIC"
-            # Similarity: report cosine if it triggered safety override, else report jaccard
-            sim_out = cos_sim if cos_sim >= SAFE_COSINE_OVERRIDE else jac
+            # Similarity: report cosine if override used; else jaccard
+            sim_out = cos if cos >= SAFE_COSINE_OVERRIDE else jac
             safe_deleted.add(del_idx)
         else:
             decision = "QA_REVIEW"
             dup_type = "SEMANTIC"
-            sim_out = cos_sim
+            sim_out = cos
 
         rows.append(
             {
@@ -284,18 +275,17 @@ def main():
 
     out_df = pd.DataFrame(rows)
 
+    # Sort: SAFE first then QA_REVIEW; within, higher similarity first
     if not out_df.empty:
         order = {"SAFEDELETESTRICT": 0, "QA_REVIEW": 1}
         out_df["_ord"] = out_df["Decision"].map(order).fillna(9)
         out_df = out_df.sort_values(["_ord", "Similarity"], ascending=[True, False]).drop(columns=["_ord"])
 
-    # ----------------------------
-    # Optional clustering
-    # ----------------------------
+    # 4) Optional clustering on flagged pairs (safe + review)
     cluster_df = None
     if enable_clustering and not out_df.empty:
         key_to_idx = {k: i for i, k in enumerate(work["_key"].tolist())}
-        edges = []
+        edges: List[Tuple[int, int]] = []
         for _, r in out_df.iterrows():
             ki = key_to_idx.get(r["Issue Key (Keep)"])
             kd = key_to_idx.get(r["Issue Key (Delete)"])
@@ -304,10 +294,11 @@ def main():
             x, y = (ki, kd) if ki < kd else (kd, ki)
             edges.append((x, y))
 
-        comps = connected_components_from_edges(len(work), edges)
+        comps = connected_components_from_edges(n, edges)
 
         cluster_rows = []
         for cid, comp in enumerate(comps, start=1):
+            # Deterministic keep for cluster
             keep_idx = comp[0]
             if created_dt is not None:
                 comp_created = [(i, created_dt.iloc[i]) for i in comp if pd.notna(created_dt.iloc[i])]
@@ -317,54 +308,91 @@ def main():
             keep_key = work["_key"].iloc[keep_idx]
             members = [work["_key"].iloc[i] for i in comp]
             cluster_rows.append(
-                {"Cluster": cid, "Size": len(comp), "Keep": keep_key, "Members": ", ".join(members)}
+                {
+                    "Cluster": cid,
+                    "Size": len(comp),
+                    "Keep": keep_key,
+                    "Members": ", ".join(members),
+                }
             )
 
         cluster_df = pd.DataFrame(cluster_rows).sort_values(["Size", "Cluster"], ascending=[False, True])
 
-    # ----------------------------
-    # Summary
-    # ----------------------------
-    total = len(work)
-    exact_cnt = int((out_df["Duplicate Type"] == "EXACT").sum()) if not out_df.empty else 0
-    safe_cnt = int((out_df["Decision"] == "SAFEDELETESTRICT").sum()) if not out_df.empty else 0
-    review_cnt = int((out_df["Decision"] == "QA_REVIEW").sum()) if not out_df.empty else 0
+    # Summary counts
+    summary = {
+        "Total issue count": int(len(work)),
+        "SAFEDELETESTRICT": int((out_df["Decision"] == "SAFEDELETESTRICT").sum()) if not out_df.empty else 0,
+        "QA_REVIEW": int((out_df["Decision"] == "QA_REVIEW").sum()) if not out_df.empty else 0,
+        "Total flagged": int(len(out_df)),
+    }
+    return out_df, cluster_df, summary
 
-    summary_df = pd.DataFrame(
-        [
-            {"Metric": "Total issue count", "Count": total},
-            {"Metric": "Candidate cosine threshold", "Count": CANDIDATE_COS_THRESHOLD},
-            {"Metric": "SAFE: (Jaccard >=)", "Count": SAFE_JACCARD_THRESHOLD},
-            {"Metric": "SAFE: (shared tokens >=)", "Count": SAFE_MIN_SHARED_TOKENS},
-            {"Metric": "SAFE: (OR cosine >=)", "Count": SAFE_COSINE_OVERRIDE},
-            {"Metric": "Top-K neighbors per issue", "Count": TOP_K_NEIGHBORS},
-            {"Metric": "EXACT duplicates", "Count": exact_cnt},
-            {"Metric": "SAFEDELETESTRICT total", "Count": safe_cnt},
-            {"Metric": "QA_REVIEW total", "Count": review_cnt},
-            {"Metric": "Total flagged (safe+review)", "Count": len(out_df)},
-        ]
-    )
 
+# ----------------------------
+# Streamlit UI
+# ----------------------------
+def main():
+    st.set_page_config(page_title="BSDV_CLEAN_DEFECT_HYBRID v3.0 (Production)", layout="wide")
+    st.title("BSDV_CLEAN_DEFECT_HYBRID v3.0 (Production)")
+
+    uploaded = st.file_uploader("Upload defects CSV", type=["csv"])
+    if not uploaded:
+        st.stop()
+
+    enable_clustering = st.checkbox("Enable clustering", value=False)
+
+    raw = uploaded.getvalue().decode("utf-8", errors="replace")
+    work, created_dt, detected = load_and_preprocess(raw)
+
+    st.write("Detected columns:")
+    st.json(detected)
+
+    with st.spinner("Running pipeline..."):
+        out_df, cluster_df, summary = run_pipeline(work, created_dt, enable_clustering)
+
+    # Summary table
+    summary_df = pd.DataFrame([{"Metric": k, "Value": v} for k, v in summary.items()])
     st.subheader("Summary")
     st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
-    st.subheader("Output")
-    st.dataframe(out_df, use_container_width=True, hide_index=True)
+    # Output split tables (requested by you previously)
+    safe_df = out_df[out_df["Decision"] == "SAFEDELETESTRICT"].copy()
+    review_df = out_df[out_df["Decision"] == "QA_REVIEW"].copy()
 
+    st.subheader("SAFEDELETESTRICT")
+    st.dataframe(safe_df, use_container_width=True, hide_index=True)
+
+    st.subheader("QA_REVIEW")
+    st.dataframe(review_df, use_container_width=True, hide_index=True)
+
+    # Download buttons
     st.download_button(
-        "Download Output CSV",
+        "Download SAFEDELETESTRICT CSV",
+        data=safe_df.to_csv(index=False).encode("utf-8"),
+        file_name="SAFEDELETESTRICT.csv",
+        mime="text/csv",
+    )
+    st.download_button(
+        "Download QA_REVIEW CSV",
+        data=review_df.to_csv(index=False).encode("utf-8"),
+        file_name="QA_REVIEW.csv",
+        mime="text/csv",
+    )
+    st.download_button(
+        "Download FULL OUTPUT CSV",
         data=out_df.to_csv(index=False).encode("utf-8"),
-        file_name="DUPLICATE_PIPELINE_OUTPUT.csv",
+        file_name="BSDV_CLEAN_DEFECT_HYBRID_OUTPUT.csv",
         mime="text/csv",
     )
 
+    # Optional clustering output
     if cluster_df is not None:
-        st.subheader("Clusters (Connected Components)")
+        st.subheader("Clusters")
         st.dataframe(cluster_df, use_container_width=True, hide_index=True)
         st.download_button(
-            "Download Clusters CSV",
+            "Download CLUSTERS CSV",
             data=cluster_df.to_csv(index=False).encode("utf-8"),
-            file_name="DUPLICATE_PIPELINE_CLUSTERS.csv",
+            file_name="DUPLICATE_CLUSTERS.csv",
             mime="text/csv",
         )
 

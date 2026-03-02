@@ -1,20 +1,3 @@
-# app.py
-# BSDV_CLEAN_DEFECT_HYBRID (FAST - Nearest Neighbors)
-# ------------------------------------------------------------
-# SAFE_DELETE_STRICT: BSDV (UNCHANGED)
-#   - EXACT: normalized text identical  -> SAFE_DELETE_STRICT
-#   - SEMANTIC SAFE: shared tokens >=5 AND Jaccard >=0.80 -> SAFE_DELETE_STRICT
-#
-# QA_REVIEW: FAST candidate generation using Top-K Nearest Neighbors (cosine)
-#   - sentence-transformers embeddings if available, else TF-IDF fallback
-#   - threshold slider applies on cosine similarity
-#   - excludes anything already marked SAFE_DELETE_STRICT
-#
-# Output: single combined table:
-#   Issue Key (Keep), Issue Key (Delete), Duplicate Type, Similarity, Decision, Method
-#
-# Run:
-#   streamlit run app.py
 
 import re
 from collections import defaultdict
@@ -26,12 +9,12 @@ import streamlit as st
 
 
 # ----------------------------
-# Locked config (BSDV SAFE stays same)
+# BSDV SAFE config (locked)
 # ----------------------------
 BSDV_MIN_SHARED_TOKENS = 5
 BSDV_SAFE_JACCARD = 0.80  # SAFE_DELETE_STRICT semantic threshold (unchanged)
 
-# Hybrid QA defaults
+# QA (fast) defaults
 QA_COS_THRESHOLD_DEFAULT = 0.86
 QA_TOPK_DEFAULT = 10
 
@@ -106,52 +89,6 @@ def determine_keep_delete(i, j, created_dt: pd.Series | None):
     return (i, j) if i < j else (j, i)
 
 
-@st.cache_resource(show_spinner=False)
-def load_embedding_model():
-    from sentence_transformers import SentenceTransformer
-
-    return SentenceTransformer("sentence-transformers/all-MiniLM-L6-v2")
-
-
-@st.cache_data(show_spinner=False)
-def topk_neighbors(texts: list[str], topk: int):
-    """
-    Returns:
-      indices: [n, topk] neighbor indices
-      sims:    [n, topk] cosine similarity
-      method:  label
-    Prefers embeddings; falls back to TF-IDF.
-    """
-    try:
-        from sklearn.neighbors import NearestNeighbors
-
-        model = load_embedding_model()
-        emb = model.encode(texts, show_progress_bar=False, normalize_embeddings=True)
-
-        nn = NearestNeighbors(n_neighbors=topk + 1, metric="cosine", algorithm="auto")
-        nn.fit(emb)
-        distances, indices = nn.kneighbors(emb)  # cosine distance = 1 - cosine sim
-
-        # drop self (first neighbor)
-        indices = indices[:, 1:]
-        sims = 1.0 - distances[:, 1:]
-        return indices, sims, "sentence-transformers + NearestNeighbors(cosine)"
-    except Exception:
-        from sklearn.feature_extraction.text import TfidfVectorizer
-        from sklearn.neighbors import NearestNeighbors
-
-        vec = TfidfVectorizer(min_df=2, ngram_range=(1, 2))
-        X = vec.fit_transform(texts)
-
-        nn = NearestNeighbors(n_neighbors=topk + 1, metric="cosine", algorithm="brute")
-        nn.fit(X)
-        distances, indices = nn.kneighbors(X)
-
-        indices = indices[:, 1:]
-        sims = 1.0 - distances[:, 1:]
-        return indices, sims, "TF-IDF + NearestNeighbors(cosine) (fallback)"
-
-
 @st.cache_data(show_spinner=False)
 def preprocess_df(raw_csv: str):
     df = pd.read_csv(StringIO(raw_csv), sep=None, engine="python", on_bad_lines="skip")
@@ -177,13 +114,37 @@ def preprocess_df(raw_csv: str):
         "Description": desc_col,
         "Created (optional)": created_col if created_col else "(not found)",
     }
-    return df, work, created_dt, detected
+    return work, created_dt, detected
+
+
+@st.cache_data(show_spinner=False)
+def tfidf_topk_neighbors(texts: list[str], topk: int):
+    """
+    TF-IDF vectors + NearestNeighbors(cosine)
+    Returns:
+      indices: [n, topk]
+      sims:    [n, topk] cosine similarity
+      method label
+    """
+    from sklearn.feature_extraction.text import TfidfVectorizer
+    from sklearn.neighbors import NearestNeighbors
+
+    vec = TfidfVectorizer(min_df=2, ngram_range=(1, 2))
+    X = vec.fit_transform(texts)
+
+    nn = NearestNeighbors(n_neighbors=topk + 1, metric="cosine", algorithm="brute")
+    nn.fit(X)
+
+    distances, indices = nn.kneighbors(X)
+    indices = indices[:, 1:]          # drop self
+    sims = 1.0 - distances[:, 1:]     # cosine sim = 1 - cosine distance
+    return indices, sims, "TF-IDF + NearestNeighbors(cosine) (ULTRA FAST)"
 
 
 def main():
-    st.set_page_config(page_title="BSDV_CLEAN_DEFECT_HYBRID (FAST)", layout="wide")
-    st.title("BSDV_CLEAN_DEFECT_HYBRID (FAST)")
-    st.caption("SAFE_DELETE_STRICT = BSDV (unchanged), QA_REVIEW = top-k cosine neighbors (fast).")
+    st.set_page_config(page_title="BSDV_CLEAN_DEFECT_HYBRID (ULTRA FAST)", layout="wide")
+    st.title("BSDV_CLEAN_DEFECT_HYBRID (ULTRA FAST)")
+    st.caption("SAFE_DELETE_STRICT = BSDV (unchanged), QA_REVIEW = TF-IDF cosine top-k neighbors.")
 
     uploaded = st.file_uploader("Upload defects CSV", type=["csv"])
 
@@ -194,14 +155,15 @@ def main():
 - EXACT: normalized text identical
 - SEMANTIC SAFE: shared tokens ≥ {BSDV_MIN_SHARED_TOKENS} AND Jaccard ≥ {BSDV_SAFE_JACCARD}
 
-**QA_REVIEW (Hybrid FAST):**
-- Top-K cosine neighbors (no NxN matrix)
+**QA_REVIEW (ULTRA FAST):**
+- TF-IDF + NearestNeighbors(cosine)
 - cosine similarity ≥ threshold (default {QA_COS_THRESHOLD_DEFAULT})
-- excludes anything already marked SAFE_DELETE_STRICT
+- only top-K neighbors per issue (default {QA_TOPK_DEFAULT})
+- excludes SAFE_DELETE_STRICT
 """
         )
 
-    run_qa = st.checkbox("Run QA_REVIEW (cosine neighbors)", value=True)
+    run_qa = st.checkbox("Run QA_REVIEW (fast)", value=True)
     qa_threshold = st.slider("QA_REVIEW cosine threshold", 0.70, 0.99, QA_COS_THRESHOLD_DEFAULT, 0.01)
     qa_topk = st.slider("QA_REVIEW top-k neighbors", 3, 30, QA_TOPK_DEFAULT, 1)
 
@@ -209,8 +171,7 @@ def main():
         st.stop()
 
     raw = uploaded.getvalue().decode("utf-8", errors="replace")
-
-    df, work, created_dt, detected = preprocess_df(raw)
+    work, created_dt, detected = preprocess_df(raw)
 
     st.write("Detected columns:")
     st.json(detected)
@@ -275,14 +236,14 @@ def main():
     safe_delete_set = set([d for _, d in exact_pairs] + [d for _, d, _ in safe_semantic_pairs])
 
     # ----------------------------
-    # QA_REVIEW (FAST top-k)
+    # QA_REVIEW (TF-IDF top-k)
     # ----------------------------
     qa_pairs = []
     qa_method = "disabled"
 
     if run_qa:
-        with st.spinner("Finding QA_REVIEW candidates (top-k cosine neighbors)..."):
-            nn_idx, nn_sim, qa_method = topk_neighbors(work["_norm"].tolist(), qa_topk)
+        with st.spinner("Finding QA_REVIEW candidates (TF-IDF top-k neighbors)..."):
+            nn_idx, nn_sim, qa_method = tfidf_topk_neighbors(work["_norm"].tolist(), qa_topk)
 
         qa_candidate_rows = []
         for i in range(len(work)):
@@ -346,7 +307,7 @@ def main():
                 "Duplicate Type": "SEMANTIC",
                 "Similarity": round(float(score), 3),
                 "Decision": "QA_REVIEW",
-                "Method": f"Hybrid QA ({qa_method})",
+                "Method": qa_method,
             }
         )
 
@@ -376,14 +337,14 @@ def main():
     st.download_button(
         "Download Combined CSV",
         data=out_df.to_csv(index=False).encode("utf-8"),
-        file_name="BSDV_CLEAN_DEFECT_HYBRID_OUTPUT.csv",
+        file_name="BSDV_CLEAN_DEFECT_HYBRID_ULTRAFAST_OUTPUT.csv",
         mime="text/csv",
     )
 
     st.download_button(
         "Download Summary CSV",
         data=summary_df.to_csv(index=False).encode("utf-8"),
-        file_name="BSDV_CLEAN_DEFECT_HYBRID_SUMMARY.csv",
+        file_name="BSDV_CLEAN_DEFECT_HYBRID_ULTRAFAST_SUMMARY.csv",
         mime="text/csv",
     )
 

@@ -1,20 +1,23 @@
 
 import re
 from collections import defaultdict
-from datetime import datetime
 from io import StringIO
 
 import numpy as np
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="BSDV_CLEAN_DEFECT", layout="wide")
-
-st.title("BSDV_CLEAN_DEFECT (V2)")
-st.caption("Single-table output with Decision = SAFE_DELETE_STRICT / QA_REVIEW")
 
 # ----------------------------
-# Config (locked)
+# UI
+# ----------------------------
+st.set_page_config(page_title="BSDV_CLEAN_DEFECT", layout="wide")
+st.title("BSDV_CLEAN_DEFECT (V2)")
+st.caption("Single-table output: SAFE_DELETE_STRICT + QA_REVIEW, with Duplicate Type column.")
+
+
+# ----------------------------
+# Locked config (your standard)
 # ----------------------------
 THRESH_MIN = 0.69
 THRESH_SAFE = 0.80
@@ -28,31 +31,31 @@ ve veya ama eğer ise değil için ile
 """.split()
 )
 
-# NOTE: These are intentionally conservative / generic.
 IGNORE_REGEXES = [
     r"\b(app\s*)?version\s*[:=]\s*[^\n\r]+",
     r"\bbuild\s*[:=]\s*[^\n\r]+",
     r"\bdevice\s*[:=]\s*[^\n\r]+",
     r"\blogs?\s*[:=]\s*[^\n\r]+",
-    r"\brepro(duction)?\b.*",  # user asked to ignore reproduction info if present in desc
+    r"\brepro(duction)?\b.*",  # if repro text is embedded, ignore
     r"https?://\S+",
     r"\b\d+\.\d+\.\d+(\.\d+)?\b",
     r"\b\d+\b",
 ]
 
+
 # ----------------------------
 # Helpers
 # ----------------------------
-def pick_col(cols, must_have_any):
-    """Pick first column whose lowercase name contains any token in must_have_any."""
+def pick_col(cols, must_contain_any):
+    """Pick first column whose lowercase name contains any keyword."""
     for c in cols:
         cl = c.lower().strip()
-        if any(k in cl for k in must_have_any):
+        if any(k in cl for k in must_contain_any):
             return c
     return None
 
 
-def normalize_text(summary: str, desc: str) -> str:
+def normalize_text(summary, desc) -> str:
     s = f"{'' if pd.isna(summary) else str(summary)} {'' if pd.isna(desc) else str(desc)}"
     s = s.lower()
     for pat in IGNORE_REGEXES:
@@ -81,59 +84,45 @@ def jaccard(a_set: set, b_set: set) -> float:
     return inter / uni if uni else 0.0
 
 
-def parse_created_series(s: pd.Series) -> pd.Series:
-    """
-    Try to parse created timestamps. Returns datetime64[ns] with NaT when unparseable.
-    Accepts Jira-style and generic formats.
-    """
-    # pandas to_datetime is flexible; errors='coerce' makes NaT
-    return pd.to_datetime(s, errors="coerce", utc=False)
+def parse_created(series: pd.Series) -> pd.Series:
+    """Parse created timestamps. Unparseable -> NaT."""
+    return pd.to_datetime(series, errors="coerce", utc=False)
 
 
 def determine_keep_delete(i, j, created_dt: pd.Series | None):
     """
-    Return (keep_idx, delete_idx) deterministically.
-    If created_dt exists and both parse -> older KEEP.
-    Else -> smaller index KEEP (earlier row).
+    Deterministic KEEP rule:
+      - if created_dt exists and both parseable -> older KEEP
+      - else -> smaller index KEEP (earlier row)
     """
     if created_dt is not None:
         ci, cj = created_dt.iloc[i], created_dt.iloc[j]
         if pd.notna(ci) and pd.notna(cj):
-            if ci <= cj:
-                return i, j
-            return j, i
-    # fallback: earlier row KEEP
+            return (i, j) if ci <= cj else (j, i)
     return (i, j) if i < j else (j, i)
 
 
 # ----------------------------
-# UI
+# Upload
 # ----------------------------
 uploaded = st.file_uploader("Upload defects CSV", type=["csv"])
-
-with st.expander("Active rules (click to view)", expanded=False):
+with st.expander("Active rules", expanded=False):
     st.markdown(
         f"""
-- Fields used: **Summary + Description**
-- Ignore (inside text): version/build/device/log/repro/url/numbers
-- EXACT: normalized text **%100 identical**
-- SEMANTIC candidate: **shared tokens ≥ {MIN_SHARED_TOKENS}**
-- SEMANTIC thresholds:
-  - **Decision = SAFE_DELETE_STRICT** if similarity **≥ {THRESH_SAFE}**
-  - **Decision = QA_REVIEW** if similarity **{THRESH_MIN}–{THRESH_SAFE - 0.01:.2f}**
-- Output: **Single table** + summary
+**Fields used:** Summary + Description  
+**SEMANTIC thresholds:** shared tokens ≥ {MIN_SHARED_TOKENS}, similarity ≥ {THRESH_MIN}  
+- **SAFE_DELETE_STRICT** if similarity ≥ {THRESH_SAFE}  
+- **QA_REVIEW** if {THRESH_MIN} ≤ similarity < {THRESH_SAFE}  
 """
     )
 
 if not uploaded:
     st.stop()
 
-# Read CSV robustly
 raw = uploaded.getvalue().decode("utf-8", errors="replace")
 df = pd.read_csv(StringIO(raw), sep=None, engine="python", on_bad_lines="skip")
 
 cols = list(df.columns)
-
 key_col = pick_col(cols, ["issue key", "issue_key", "key"]) or cols[0]
 summary_col = pick_col(cols, ["summary", "title"]) or cols[0]
 desc_col = pick_col(cols, ["description"]) or cols[0]
@@ -149,21 +138,25 @@ st.json(
     }
 )
 
+# ----------------------------
+# Prepare work df
+# ----------------------------
 work = df.copy()
 work["_row"] = np.arange(len(work))
 work["_key"] = work[key_col].astype(str).str.strip()
 work["_norm"] = [normalize_text(a, b) for a, b in zip(work[summary_col], work[desc_col])]
-work["_tokens"] = work["_norm"].apply(tokenize)
-work["_set"] = work["_tokens"].apply(set)
+work["_set"] = work["_norm"].apply(lambda x: set(tokenize(x)))
 
 created_dt = None
 if created_col:
-    created_dt = parse_created_series(work[created_col])
+    created_dt = parse_created(work[created_col])
 
-# 1) EXACT (by normalized text identity)
+# ----------------------------
+# 1) EXACT duplicates
+# ----------------------------
 seen_norm = {}
-exact_pairs = []  # list of (keep_idx, delete_idx)
-exact_delete_idx = set()
+exact_pairs = []          # (keep_idx, delete_idx)
+exact_delete_idx = set()  # delete indices to exclude from semantic
 
 for i, nm in enumerate(work["_norm"]):
     if not nm:
@@ -176,37 +169,35 @@ for i, nm in enumerate(work["_norm"]):
     else:
         seen_norm[nm] = i
 
-# 2) SEMANTIC (>= 0.69) using inverted index to avoid O(n^2)
+# ----------------------------
+# 2) SEMANTIC duplicates (candidate index)
+# ----------------------------
 inv = defaultdict(list)
 for i, s in enumerate(work["_set"]):
     for t in s:
         inv[t].append(i)
 
-semantic_pairs = []  # (keep_idx, delete_idx, score)
-semantic_delete_idx = set()
-
-seen_pair = set()
+semantic_pairs = []          # (keep_idx, delete_idx, score)
+semantic_delete_idx = set()  # ensure one delete target once
+seen_pair = set()            # avoid duplicate pair scoring
 
 for i, si in enumerate(work["_set"]):
     if i in exact_delete_idx or i in semantic_delete_idx:
         continue
 
-    # candidate generation
-    cand = set()
+    candidates = set()
     for t in si:
-        cand.update(inv[t])
+        candidates.update(inv[t])
 
-    for j in cand:
+    for j in candidates:
         if j == i:
             continue
 
-        # avoid duplicates
         a, b = (j, i) if j < i else (i, j)
         if (a, b) in seen_pair:
             continue
         seen_pair.add((a, b))
 
-        # compute
         sj = work["_set"].iloc[j]
         shared = len(si & sj)
         if shared < MIN_SHARED_TOKENS:
@@ -217,35 +208,37 @@ for i, si in enumerate(work["_set"]):
             continue
 
         keep_idx, del_idx = determine_keep_delete(i, j, created_dt)
-
-        # do not mark something as delete twice
         if del_idx in exact_delete_idx or del_idx in semantic_delete_idx:
             continue
 
         semantic_pairs.append((keep_idx, del_idx, score))
         semantic_delete_idx.add(del_idx)
 
-# Build combined output table
+# ----------------------------
+# Build single combined output
+# ----------------------------
 rows = []
 
+# EXACT -> always SAFE_DELETE_STRICT
 for keep_idx, del_idx in exact_pairs:
     rows.append(
         {
             "Issue Key (Keep)": work["_key"].iloc[keep_idx],
             "Issue Key (Delete)": work["_key"].iloc[del_idx],
-            "Type": "EXACT",
+            "Duplicate Type": "EXACT",
             "Similarity": 1.000,
             "Decision": "SAFE_DELETE_STRICT",
         }
     )
 
+# SEMANTIC -> decision by score
 for keep_idx, del_idx, score in semantic_pairs:
     decision = "SAFE_DELETE_STRICT" if score >= THRESH_SAFE else "QA_REVIEW"
     rows.append(
         {
             "Issue Key (Keep)": work["_key"].iloc[keep_idx],
             "Issue Key (Delete)": work["_key"].iloc[del_idx],
-            "Type": "SEMANTIC",
+            "Duplicate Type": "SEMANTIC",
             "Similarity": round(float(score), 3),
             "Decision": decision,
         }
@@ -253,16 +246,18 @@ for keep_idx, del_idx, score in semantic_pairs:
 
 out_df = pd.DataFrame(rows)
 
+# stable sort: SAFE_DELETE_STRICT first, then QA_REVIEW; then similarity desc
 if not out_df.empty:
-    # stable sort: SAFE_DELETE_STRICT first, then QA_REVIEW; then similarity desc
-    order = {"SAFE_DELETE_STRICT": 0, "QA_REVIEW": 1}
-    out_df["_ord"] = out_df["Decision"].map(order).fillna(9)
+    decision_order = {"SAFE_DELETE_STRICT": 0, "QA_REVIEW": 1}
+    out_df["_ord"] = out_df["Decision"].map(decision_order).fillna(9)
     out_df = out_df.sort_values(["_ord", "Similarity"], ascending=[True, False]).drop(columns=["_ord"])
 
-# Summary
+# ----------------------------
+# Summary table
+# ----------------------------
 total = len(work)
-exact_cnt = int((out_df["Type"] == "EXACT").sum()) if not out_df.empty else 0
-semantic_cnt = int((out_df["Type"] == "SEMANTIC").sum()) if not out_df.empty else 0
+exact_cnt = int((out_df["Duplicate Type"] == "EXACT").sum()) if not out_df.empty else 0
+semantic_cnt = int((out_df["Duplicate Type"] == "SEMANTIC").sum()) if not out_df.empty else 0
 safe_cnt = int((out_df["Decision"] == "SAFE_DELETE_STRICT").sum()) if not out_df.empty else 0
 review_cnt = int((out_df["Decision"] == "QA_REVIEW").sum()) if not out_df.empty else 0
 
@@ -286,22 +281,21 @@ st.dataframe(summary_df, use_container_width=True, hide_index=True)
 st.subheader("Combined Output (SAFE_DELETE_STRICT + QA_REVIEW)")
 st.dataframe(out_df, use_container_width=True, hide_index=True)
 
+# ----------------------------
 # Downloads
-csv_out = out_df.to_csv(index=False).encode("utf-8")
-csv_sum = summary_df.to_csv(index=False).encode("utf-8")
-
+# ----------------------------
 st.download_button(
     "Download Combined CSV",
-    data=csv_out,
+    data=out_df.to_csv(index=False).encode("utf-8"),
     file_name="BSDV_CLEAN_DEFECT_OUTPUT.csv",
     mime="text/csv",
 )
 
 st.download_button(
     "Download Summary CSV",
-    data=csv_sum,
+    data=summary_df.to_csv(index=False).encode("utf-8"),
     file_name="BSDV_CLEAN_DEFECT_SUMMARY.csv",
     mime="text/csv",
 )
 
-st.caption("Note: This tool is conservative; QA_REVIEW items should be manually validated for same root cause.")
+st.caption("QA_REVIEW items must be validated for same root cause before deletion.")

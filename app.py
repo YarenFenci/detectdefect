@@ -341,15 +341,15 @@ def run_pipeline(work: pd.DataFrame, created_dt: Optional[pd.Series], emb: Optio
             deleted_already.add(del_idx)
         elif token_safe or emb_safe:
             decision  = "SAFEDELETESTRICT"
-            dup_type  = "SEMANTIC" if token_safe else "SEMANTIC_EMB"
-            sim_out   = jac if token_safe else (sem_cos or tfidf_cos)
+            dup_type  = "SEMANTIC_EMB"
+            sim_out   = sem_cos if (sem_cos is not None) else jac
             deleted_already.add(del_idx)
         elif emb_review or tfidf_cos >= CANDIDATE_COS_THRESHOLD:
             decision  = "QA_REVIEW"
-            dup_type  = "SEMANTIC_EMB" if (use_semantic and emb_review) else "SEMANTIC"
+            dup_type  = "SEMANTIC_EMB"
             sim_out   = sem_cos if (use_semantic and sem_cos is not None) else tfidf_cos
         else:
-            continue  # below all thresholds after semantic check — skip
+            continue
 
         out_rows.append({
             "Issue Key (Keep)":   work["_key"].iloc[keep_idx],
@@ -518,6 +518,10 @@ def main():
             file_name="defect_duplicates_diagnostics.csv",
             mime="text/csv",
         )
+
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":

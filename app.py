@@ -1,35 +1,4 @@
-# app.py
-# BSDV_CLEAN_DEFECT_HYBRID (Production-Safe) — FIXED SAFEDELETESTRICT
-# -----------------------------------------------------------------------------
-# Problem fixed:
-#   - Removed "cosine >= 0.92" as a standalone SAFEDELETESTRICT trigger.
-#   - SAFEDELETESTRICT is now ONLY:
-#       * EXACT: normalized text identical
-#       * SEMANTIC SAFE: Jaccard >= 0.80 AND shared_tokens >= 5
-#
-# Candidate Generation (for coverage):
-#   - TF-IDF cosine >= 0.65
-#   - Top-K neighbors = 50
-#
-# QA_REVIEW:
-#   - Candidate but not SAFEDELETESTRICT (i.e., cosine >= 0.65, but SAFE rule not met)
-#
-# Clustering:
-#   - Connected components to show duplicate groups
-#
-# UI:
-#   - Separate tables: SAFEDELETESTRICT, QA_REVIEW, CLUSTERS
-# Download:
-#   - ONE CSV file containing 3 sections (SAFE / QA_REVIEW / CLUSTERS)
-#
-# Output Columns (SAFE/QA):
-#   Issue Key (Keep), Issue Key (Delete), Duplicate Type, Similarity, Decision
-#
-# requirements.txt:
-#   streamlit
-#   pandas
-#   numpy
-#   scikit-learn
+
 
 import re
 from collections import deque
@@ -41,15 +10,18 @@ import streamlit as st
 
 
 # ----------------------------
-# Locked config (current)
+# Config (LATEST)
 # ----------------------------
+# Candidate generation (recall)
 CANDIDATE_COS_THRESHOLD = 0.65
 TOP_K_NEIGHBORS = 50
 
-# SAFEDELETESTRICT (FIXED)
+# SAFEDELETESTRICT (precision)
 SAFE_JACCARD_THRESHOLD = 0.80
 SAFE_MIN_SHARED_TOKENS = 5
+SAFE_MIN_SEMANTIC_COSINE = 0.78  # semantic agreement guard (TF-IDF cosine)
 
+# Stopwords (light)
 STOPWORDS = set(
     """
 a an the and or but if then else when while for to of in on at by with without from into
@@ -58,7 +30,7 @@ ve veya ama eğer ise değil için ile
 """.split()
 )
 
-# User rule: ignore log / version / reproduction differences
+# Ignore: log/version/repro fields per your rule
 IGNORE_REGEXES = [
     r"\b(app\s*)?version\s*[:=]\s*[^\n\r]+",
     r"\bbuild\s*[:=]\s*[^\n\r]+",
@@ -69,6 +41,21 @@ IGNORE_REGEXES = [
     r"\b\d+\.\d+\.\d+(\.\d+)?\b",
     r"\b\d+\b",
 ]
+
+# Intent keywords (BiP-oriented)
+INTENT_KEYWORDS = set(
+    """
+login logout register signup sign-in sign-in otp verification verify password pin biometrics fingerprint faceid
+message chat send receive delivery delivered read unread typing sticker emoji gif media photo video file document
+call voice video_call videocall ringing ring answer decline reject missed mute speaker bluetooth headset mic microphone
+notification push badge sound vibration
+channel discovery explore search
+story status
+permission camera contacts storage location
+crash freeze hang stuck lag slow anr
+error failed fail cannot can't unable wont won't
+""".lower().replace("video_call", "videocall").split()
+)
 
 
 # ----------------------------
@@ -107,6 +94,23 @@ def jaccard(a_set: Set[str], b_set: Set[str]) -> float:
     if not a_set or not b_set:
         return 0.0
     return len(a_set & b_set) / len(a_set | b_set)
+
+
+def intent_tokens(token_set: Set[str]) -> Set[str]:
+    # map some variants
+    mapped = set()
+    for t in token_set:
+        if t == "video_call":
+            mapped.add("videocall")
+        else:
+            mapped.add(t)
+    return {t for t in mapped if t in INTENT_KEYWORDS}
+
+
+def intent_overlap_ok(a_set: Set[str], b_set: Set[str]) -> bool:
+    ia = intent_tokens(a_set)
+    ib = intent_tokens(b_set)
+    return len(ia & ib) >= 1
 
 
 def parse_created(series: pd.Series) -> pd.Series:
@@ -219,7 +223,7 @@ def connected_components(n: int, edges: List[Tuple[int, int]]) -> List[List[int]
 def run_pipeline(work: pd.DataFrame, created_dt: Optional[pd.Series]):
     n = len(work)
 
-    # 1) EXACT duplicates
+    # 1) EXACT duplicates (normalized equality)
     seen_norm: Dict[str, int] = {}
     exact_pairs: List[Tuple[int, int]] = []
     exact_deleted: Set[int] = set()
@@ -238,7 +242,7 @@ def run_pipeline(work: pd.DataFrame, created_dt: Optional[pd.Series]):
     # 2) Candidate generation via TF-IDF cosine
     nn_idx, nn_sim = tfidf_topk_neighbors(work["_norm"].tolist(), TOP_K_NEIGHBORS)
 
-    # Deduplicate candidate pairs
+    # Deduplicate candidate pairs, keep best cosine
     cand_best: Dict[Tuple[int, int], float] = {}
     for i in range(n):
         for pos in range(nn_idx.shape[1]):
@@ -285,14 +289,22 @@ def run_pipeline(work: pd.DataFrame, created_dt: Optional[pd.Series]):
         shared = len(sa & sb)
         jac = jaccard(sa, sb)
 
-        # FIXED SAFEDELETESTRICT:
-        # ONLY Jaccard+shared (NO cosine-only safe)
-        is_safe = (shared >= SAFE_MIN_SHARED_TOKENS and jac >= SAFE_JACCARD_THRESHOLD)
+        # LATEST SAFEDELETESTRICT:
+        #   must pass ALL:
+        #     - strong overlap
+        #     - intent overlap
+        #     - semantic agreement (cosine high enough)
+        is_safe = (
+            shared >= SAFE_MIN_SHARED_TOKENS
+            and jac >= SAFE_JACCARD_THRESHOLD
+            and intent_overlap_ok(sa, sb)
+            and cos >= SAFE_MIN_SEMANTIC_COSINE
+        )
 
         if is_safe:
             decision = "SAFEDELETESTRICT"
             dup_type = "SEMANTIC"
-            sim_out = jac
+            sim_out = jac  # deterministic + conservative for SAFE
             safe_deleted.add(del_idx)
         else:
             decision = "QA_REVIEW"
@@ -312,16 +324,24 @@ def run_pipeline(work: pd.DataFrame, created_dt: Optional[pd.Series]):
 
     out_df = pd.DataFrame(out_rows)
 
-    # Sort
+    # Sort: SAFE first, then QA; within, higher similarity first
     if not out_df.empty:
         order = {"SAFEDELETESTRICT": 0, "QA_REVIEW": 1}
         out_df["_ord"] = out_df["Decision"].map(order).fillna(9)
         out_df = out_df.sort_values(["_ord", "Similarity"], ascending=[True, False]).drop(columns=["_ord"])
 
-    safe_df = out_df[out_df["Decision"] == "SAFEDELETESTRICT"].copy() if not out_df.empty else pd.DataFrame(columns=["Issue Key (Keep)","Issue Key (Delete)","Duplicate Type","Similarity","Decision"])
-    review_df = out_df[out_df["Decision"] == "QA_REVIEW"].copy() if not out_df.empty else pd.DataFrame(columns=["Issue Key (Keep)","Issue Key (Delete)","Duplicate Type","Similarity","Decision"])
+    safe_df = (
+        out_df[out_df["Decision"] == "SAFEDELETESTRICT"].copy()
+        if not out_df.empty
+        else pd.DataFrame(columns=["Issue Key (Keep)", "Issue Key (Delete)", "Duplicate Type", "Similarity", "Decision"])
+    )
+    review_df = (
+        out_df[out_df["Decision"] == "QA_REVIEW"].copy()
+        if not out_df.empty
+        else pd.DataFrame(columns=["Issue Key (Keep)", "Issue Key (Delete)", "Duplicate Type", "Similarity", "Decision"])
+    )
 
-    # 4) Clusters
+    # 4) Clustering (connected components on all flagged edges)
     clusters = connected_components(n, edges_for_cluster) if edges_for_cluster else []
     cluster_df = None
     if clusters:
@@ -339,6 +359,8 @@ def run_pipeline(work: pd.DataFrame, created_dt: Optional[pd.Series]):
             {"Metric": "Top-K neighbors", "Count": TOP_K_NEIGHBORS},
             {"Metric": "SAFE: Jaccard threshold", "Count": SAFE_JACCARD_THRESHOLD},
             {"Metric": "SAFE: shared tokens", "Count": SAFE_MIN_SHARED_TOKENS},
+            {"Metric": "SAFE: semantic cosine guard", "Count": SAFE_MIN_SEMANTIC_COSINE},
+            {"Metric": "SAFE: intent overlap required", "Count": "YES"},
             {"Metric": "Exact duplicate count", "Count": int((safe_df["Duplicate Type"] == "EXACT").sum()) if not safe_df.empty else 0},
             {"Metric": "SAFEDELETESTRICT", "Count": int(len(safe_df))},
             {"Metric": "QA_REVIEW", "Count": int(len(review_df))},
@@ -354,8 +376,8 @@ def run_pipeline(work: pd.DataFrame, created_dt: Optional[pd.Series]):
 # Streamlit UI
 # ----------------------------
 def main():
-    st.set_page_config(page_title="BSDV_CLEAN_DEFECT_HYBRID (Production-Safe)", layout="wide")
-    st.title("BSDV_CLEAN_DEFECT_HYBRID (Production-Safe)")
+    st.set_page_config(page_title="BSDV_CLEAN_DEFECT_HYBRID (Latest)", layout="wide")
+    st.title("BSDV_CLEAN_DEFECT_HYBRID (Latest)")
 
     uploaded = st.file_uploader("Upload defects CSV", type=["csv"], key="uploader_defects_csv")
     if not uploaded:
@@ -399,6 +421,9 @@ def main():
         key="dl_all_one",
     )
 
+
+if __name__ == "__main__":
+    main()
 
 if __name__ == "__main__":
     main()

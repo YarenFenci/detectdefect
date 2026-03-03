@@ -10,55 +10,51 @@ import streamlit as st
 # ----------------------------
 # Config
 # ----------------------------
-CANDIDATE_COS_THRESHOLD = 0.55        # TF-IDF pre-filter (broader net)
-TOP_K_NEIGHBORS = 50
+CANDIDATE_COS_THRESHOLD   = 0.60    # TF-IDF pre-filter
+TOP_K_NEIGHBORS           = 50
+SAFE_TOKEN_MIN            = 15
 
-SAFE_TOKEN_MIN = 15                    # relaxed — semantic compensates
+# Token-level guard
+SAFE_JACCARD_THRESHOLD    = 0.88
+SAFE_MIN_SHARED_TOKENS    = 10
+SAFE_MIN_TFIDF_COSINE     = 0.82
 
-# Strict SAFE thresholds (token-level)
-SAFE_JACCARD_THRESHOLD = 0.85
-SAFE_MIN_SHARED_TOKENS = 8
-SAFE_MIN_SEMANTIC_COSINE = 0.78
+# Embedding threshold — single high-confidence gate
+SEMANTIC_EMB_THRESHOLD    = 0.86
+MIN_SIMILARITY_OUTPUT     = 0.75    # absolute floor
 
-# Semantic-only SAFE (when sentence-transformers kicks in)
-SEMANTIC_EMB_SAFE_THRESHOLD = 0.82    # embedding cosine → SAFEDELETESTRICT
-SEMANTIC_EMB_REVIEW_THRESHOLD = 0.60  # embedding cosine → QA_REVIEW
+SENTENCE_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
 
-# User-flow / scenario keywords grouped by flow
+# User-flow scenario groups
 FLOW_GROUPS: Dict[str, Set[str]] = {
-    "auth":        {"login","logout","signin","signup","register","otp","verification","verify",
-                    "password","pin","biometrics","fingerprint","faceid","2fa","authentication"},
-    "messaging":   {"message","chat","send","receive","delivery","delivered","read","unread",
-                    "typing","sticker","emoji","gif","media","photo","video","file","document",
-                    "forward","reply","delete","unsend","attachment"},
-    "calling":     {"call","voice","videocall","video","ringing","ring","answer","decline",
-                    "reject","missed","mute","speaker","bluetooth","headset","mic","microphone",
-                    "call_quality","echo","noise"},
-    "notification":{"notification","push","badge","sound","vibration","alert","banner"},
-    "channel":     {"channel","discovery","explore","search","find","broadcast"},
-    "story":       {"story","status","highlight","viewer","reaction"},
-    "settings":    {"settings","profile","privacy","account","theme","language","backup",
-                    "sync","storage"},
-    "permission":  {"permission","camera","contacts","location","microphone","allow","deny",
-                    "granted","revoked"},
-    "crash":       {"crash","freeze","hang","stuck","lag","slow","anr","unresponsive",
-                    "force_close","not_responding","black_screen","white_screen"},
-    "payment":     {"payment","purchase","subscription","billing","invoice","refund","card",
-                    "wallet","topup","transfer","transaction"},
-    "ui":          {"menu","overflow","kebab","tab","button","tap","click","press",
-                    "longpress","swipe","scroll","open","close","back","gesture",
-                    "layout","overlap","misalign","truncate","cut","hidden"},
+    "auth":         {"login","logout","signin","signup","register","otp","verification","verify",
+                     "password","pin","biometrics","fingerprint","faceid","2fa","authentication"},
+    "messaging":    {"message","chat","send","receive","delivery","delivered","read","unread",
+                     "typing","sticker","emoji","gif","media","photo","video","file","document",
+                     "forward","reply","delete","unsend","attachment"},
+    "calling":      {"call","voice","videocall","video","ringing","ring","answer","decline",
+                     "reject","missed","mute","speaker","bluetooth","headset","mic","microphone",
+                     "call_quality","echo","noise"},
+    "notification": {"notification","push","badge","sound","vibration","alert","banner"},
+    "channel":      {"channel","discovery","explore","search","find","broadcast"},
+    "story":        {"story","status","highlight","viewer","reaction"},
+    "settings":     {"settings","profile","privacy","account","theme","language","backup",
+                     "sync","storage"},
+    "permission":   {"permission","camera","contacts","location","microphone","allow","deny",
+                     "granted","revoked"},
+    "crash":        {"crash","freeze","hang","stuck","lag","slow","anr","unresponsive",
+                     "force_close","not_responding","black_screen","white_screen"},
+    "payment":      {"payment","purchase","subscription","billing","invoice","refund","card",
+                     "wallet","topup","transfer","transaction"},
+    "ui":           {"menu","overflow","kebab","tab","button","tap","click","press",
+                     "longpress","swipe","scroll","open","close","back","gesture",
+                     "layout","overlap","misalign","truncate","cut","hidden"},
 }
 
-# Flat intent set (for quick lookup)
-INTENT_KEYWORDS: Set[str] = {kw for grp in FLOW_GROUPS.values() for kw in grp}
-
 STOPWORDS = set(
-    """
-a an the and or but if then else when while for to of in on at by with without from into
-is are was were be been being this that these those it its as
-ve veya ama eğer ise değil için ile bir bu da de
-""".split()
+    "a an the and or but if then else when while for to of in on at by with without "
+    "from into is are was were be been being this that these those it its as "
+    "ve veya ama eger ise degil icin ile bir bu da de".split()
 )
 
 IGNORE_REGEXES = [
@@ -72,46 +68,39 @@ IGNORE_REGEXES = [
     r"\b\d+\b",
 ]
 
-SENTENCE_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
-
 
 # ----------------------------
-# Sentence-transformers loader (cached)
+# Sentence-transformers
 # ----------------------------
-@st.cache_resource(show_spinner="Loading semantic model…")
+@st.cache_resource(show_spinner="Loading semantic model...")
 def load_sentence_model():
     try:
         from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer(SENTENCE_MODEL_NAME)
-        return model
+        return SentenceTransformer(SENTENCE_MODEL_NAME)
     except ImportError:
-        st.error(
-            "sentence-transformers not installed. Run:\n\n"
-            "  pip install sentence-transformers\n\n"
-            "Falling back to TF-IDF only mode."
-        )
+        st.error("sentence-transformers not installed.\n\npip install sentence-transformers")
         return None
 
 
-@st.cache_data(show_spinner="Encoding semantic embeddings…")
+@st.cache_data(show_spinner="Encoding embeddings...")
 def encode_texts(_model, texts: Tuple[str, ...]) -> Optional[np.ndarray]:
     if _model is None:
         return None
-    return _model.encode(list(texts), batch_size=64, show_progress_bar=False, normalize_embeddings=True)
+    return _model.encode(
+        list(texts), batch_size=64, show_progress_bar=False, normalize_embeddings=True
+    )
 
 
-def semantic_cosine(emb: np.ndarray, i: int, j: int) -> float:
-    """Cosine similarity from L2-normalised embeddings (dot product)."""
+def cosine_emb(emb: np.ndarray, i: int, j: int) -> float:
     return float(np.dot(emb[i], emb[j]))
 
 
 # ----------------------------
 # Helpers
 # ----------------------------
-def pick_col(cols: List[str], must_contain_any: List[str]) -> Optional[str]:
+def pick_col(cols: List[str], keywords: List[str]) -> Optional[str]:
     for c in cols:
-        cl = c.lower().strip()
-        if any(k in cl for k in must_contain_any):
+        if any(k in c.lower() for k in keywords):
             return c
     return None
 
@@ -122,41 +111,30 @@ def normalize_text(summary, desc) -> str:
     for pat in IGNORE_REGEXES:
         s = re.sub(pat, " ", s, flags=re.IGNORECASE)
     s = re.sub(r"[^\w\s]", " ", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    return s
+    return re.sub(r"\s+", " ", s).strip()
 
 
 def tokenize(norm: str) -> List[str]:
     return [t for t in norm.split() if len(t) >= 3 and t not in STOPWORDS]
 
 
-def jaccard(a_set: Set[str], b_set: Set[str]) -> float:
-    if not a_set or not b_set:
-        return 0.0
-    return len(a_set & b_set) / len(a_set | b_set)
+def jaccard(a: Set[str], b: Set[str]) -> float:
+    return len(a & b) / len(a | b) if (a and b) else 0.0
 
 
 def get_flows(token_set: Set[str]) -> Set[str]:
-    """Return which user flows are present in this issue."""
-    flows = set()
-    for flow, keywords in FLOW_GROUPS.items():
-        if token_set & keywords:
-            flows.add(flow)
-    return flows
+    return {flow for flow, kws in FLOW_GROUPS.items() if token_set & kws}
 
 
-def flow_overlap(a_set: Set[str], b_set: Set[str]) -> Tuple[int, Set[str]]:
-    fa = get_flows(a_set)
-    fb = get_flows(b_set)
-    shared = fa & fb
-    return len(shared), shared
+def flow_overlap_count(a: Set[str], b: Set[str]) -> int:
+    return len(get_flows(a) & get_flows(b))
 
 
 def parse_created(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, errors="coerce", utc=False)
 
 
-def determine_keep_delete(i: int, j: int, created_dt: Optional[pd.Series]) -> Tuple[int, int]:
+def keep_delete(i: int, j: int, created_dt: Optional[pd.Series]) -> Tuple[int, int]:
     if created_dt is not None:
         ci, cj = created_dt.iloc[i], created_dt.iloc[j]
         if pd.notna(ci) and pd.notna(cj):
@@ -164,7 +142,7 @@ def determine_keep_delete(i: int, j: int, created_dt: Optional[pd.Series]) -> Tu
     return (i, j) if i < j else (j, i)
 
 
-def df_to_section_csv(df: Optional[pd.DataFrame], title: str) -> str:
+def df_to_csv_section(df: Optional[pd.DataFrame], title: str) -> str:
     header = f"# {title}\n"
     if df is None or df.empty:
         return header + "(empty)\n\n"
@@ -172,7 +150,7 @@ def df_to_section_csv(df: Optional[pd.DataFrame], title: str) -> str:
 
 
 # ----------------------------
-# Data prep / TF-IDF neighbors
+# Data prep
 # ----------------------------
 @st.cache_data(show_spinner=False)
 def load_and_preprocess(raw_csv: str):
@@ -180,49 +158,42 @@ def load_and_preprocess(raw_csv: str):
     cols = list(df.columns)
 
     key_col     = pick_col(cols, ["issue key", "issue_key", "key"]) or cols[0]
-    summary_col = pick_col(cols, ["summary", "title"]) or cols[0]
-    desc_col    = pick_col(cols, ["description"]) or cols[0]
+    summary_col = pick_col(cols, ["summary", "title"])              or cols[0]
+    desc_col    = pick_col(cols, ["description"])                   or cols[0]
     created_col = pick_col(cols, ["created", "created date", "created_at", "createdat"])
 
-    work = df.copy()
-    work["_key"]       = work[key_col].astype(str).str.strip()
-    work["_norm"]      = [normalize_text(a, b) for a, b in zip(work[summary_col], work[desc_col])]
-    work["_tokens"]    = work["_norm"].apply(tokenize)
-    work["_set"]       = work["_tokens"].apply(set)
-    work["_tok_count"] = work["_tokens"].apply(len)
-
-    # Raw text for semantic embedding (summary + description, no noise stripping)
-    work["_raw_text"]  = [
+    w = df.copy()
+    w["_key"]       = w[key_col].astype(str).str.strip()
+    w["_norm"]      = [normalize_text(a, b) for a, b in zip(w[summary_col], w[desc_col])]
+    w["_tokens"]    = w["_norm"].apply(tokenize)
+    w["_set"]       = w["_tokens"].apply(set)
+    w["_tok_count"] = w["_tokens"].apply(len)
+    w["_raw"]       = [
         f"{'' if pd.isna(a) else str(a)} {'' if pd.isna(b) else str(b)}".strip()
-        for a, b in zip(work[summary_col], work[desc_col])
+        for a, b in zip(w[summary_col], w[desc_col])
     ]
 
-    created_dt = parse_created(work[created_col]) if created_col else None
-
+    created_dt = parse_created(w[created_col]) if created_col else None
     detected = {
-        "Issue Key":            key_col,
-        "Summary/Title":        summary_col,
-        "Description":          desc_col,
-        "Created (optional)":   created_col if created_col else "(not found)",
+        "Issue Key":          key_col,
+        "Summary / Title":    summary_col,
+        "Description":        desc_col,
+        "Created (optional)": created_col or "(not found)",
     }
-    return work, created_dt, detected
+    return w, created_dt, detected
 
 
-@st.cache_data(show_spinner="Building TF-IDF candidate index…")
-def tfidf_topk_neighbors(texts: List[str], topk: int):
+@st.cache_data(show_spinner="Building TF-IDF index...")
+def tfidf_neighbors(texts: List[str], topk: int):
     from sklearn.feature_extraction.text import TfidfVectorizer
     from sklearn.neighbors import NearestNeighbors
 
-    vec = TfidfVectorizer(min_df=1, ngram_range=(1, 2))
-    X = vec.fit_transform(texts)
+    X = TfidfVectorizer(min_df=1, ngram_range=(1, 2)).fit_transform(texts)
     nn = NearestNeighbors(
-        n_neighbors=min(topk + 1, X.shape[0]),
-        metric="cosine",
-        algorithm="brute",
-    )
-    nn.fit(X)
-    distances, indices = nn.kneighbors(X)
-    return indices[:, 1:], 1.0 - distances[:, 1:]
+        n_neighbors=min(topk + 1, X.shape[0]), metric="cosine", algorithm="brute"
+    ).fit(X)
+    dist, idx = nn.kneighbors(X)
+    return idx[:, 1:], 1.0 - dist[:, 1:]
 
 
 def connected_components(n: int, edges: List[Tuple[int, int]]) -> List[List[int]]:
@@ -256,202 +227,119 @@ def connected_components(n: int, edges: List[Tuple[int, int]]) -> List[List[int]
 # ----------------------------
 def run_pipeline(work: pd.DataFrame, created_dt: Optional[pd.Series], emb: Optional[np.ndarray]):
     n = len(work)
-    use_semantic = emb is not None
+    use_emb = emb is not None
 
-    # 1) TF-IDF candidate pairs
-    nn_idx, nn_sim = tfidf_topk_neighbors(work["_norm"].tolist(), TOP_K_NEIGHBORS)
+    nn_idx, nn_sim = tfidf_neighbors(work["_norm"].tolist(), TOP_K_NEIGHBORS)
 
-    cand_best: Dict[Tuple[int, int], float] = {}
+    # Build candidate pairs
+    cand: Dict[Tuple[int, int], float] = {}
     for i in range(n):
         for pos in range(nn_idx.shape[1]):
-            j = int(nn_idx[i, pos])
-            cos = float(nn_sim[i, pos])
-            if cos < CANDIDATE_COS_THRESHOLD:
+            j   = int(nn_idx[i, pos])
+            c   = float(nn_sim[i, pos])
+            if c < CANDIDATE_COS_THRESHOLD:
                 continue
             a, b = (i, j) if i < j else (j, i)
-            if a == b:
-                continue
-            if (a, b) not in cand_best or cos > cand_best[(a, b)]:
-                cand_best[(a, b)] = cos
+            if a != b and c > cand.get((a, b), 0):
+                cand[(a, b)] = c
 
-    candidate_pairs = sorted(cand_best.items(), key=lambda x: x[1], reverse=True)
+    rows:    List[Dict]          = []
+    deleted: Set[int]            = set()
+    edges:   List[Tuple[int,int]] = []
 
-    # 2) Score + classify each candidate pair
-    deleted_already: Set[int] = set()
-    out_rows: List[Dict] = []
-    edges_for_cluster: List[Tuple[int, int]] = []
-
-    for (a, b), tfidf_cos in candidate_pairs:
-        keep_idx, del_idx = determine_keep_delete(a, b, created_dt)
-        if del_idx in deleted_already:
+    for (a, b), tfidf_c in sorted(cand.items(), key=lambda x: x[1], reverse=True):
+        ki, di = keep_delete(a, b, created_dt)
+        if di in deleted:
             continue
 
-        set_keep = work["_set"].iloc[keep_idx]
-        set_del  = work["_set"].iloc[del_idx]
-        norm_keep = work["_norm"].iloc[keep_idx]
-        norm_del  = work["_norm"].iloc[del_idx]
+        s_k  = work["_set"].iloc[ki]
+        s_d  = work["_set"].iloc[di]
+        n_k  = work["_norm"].iloc[ki]
+        n_d  = work["_norm"].iloc[di]
+        tc_k = int(work["_tok_count"].iloc[ki])
+        tc_d = int(work["_tok_count"].iloc[di])
 
-        tok_keep = int(work["_tok_count"].iloc[keep_idx])
-        tok_del  = int(work["_tok_count"].iloc[del_idx])
+        # Must share at least one user flow
+        if flow_overlap_count(s_k, s_d) < 1:
+            continue
 
-        shared   = len(set_keep & set_del)
-        jac      = jaccard(set_keep, set_del)
+        shared = len(s_k & s_d)
+        jac    = jaccard(s_k, s_d)
+        sc     = cosine_emb(emb, ki, di) if use_emb else None
+        has_ev = tc_k >= SAFE_TOKEN_MIN and tc_d >= SAFE_TOKEN_MIN
 
-        # Flow / scenario overlap
-        n_flows, shared_flows = flow_overlap(set_keep, set_del)
-
-        # Semantic embedding cosine (if available)
-        sem_cos = semantic_cosine(emb, keep_idx, del_idx) if use_semantic else None
-
-        has_evidence = (tok_keep >= SAFE_TOKEN_MIN and tok_del >= SAFE_TOKEN_MIN)
-        has_flow     = (n_flows >= 1)
-
-        # ── Decision logic ──────────────────────────────────────────────
-        exact_safe = (norm_keep == norm_del) and has_evidence and has_flow
-
-        # Token-level strict safe (original logic, requires flow overlap now)
-        token_safe = (
-            has_evidence
-            and has_flow
-            and jac >= SAFE_JACCARD_THRESHOLD
+        # Confidence gates
+        exact          = (n_k == n_d) and has_ev
+        token_confident = (
+            has_ev
+            and jac    >= SAFE_JACCARD_THRESHOLD
             and shared >= SAFE_MIN_SHARED_TOKENS
-            and tfidf_cos >= SAFE_MIN_SEMANTIC_COSINE
+            and tfidf_c >= SAFE_MIN_TFIDF_COSINE
         )
+        emb_confident = use_emb and sc is not None and sc >= SEMANTIC_EMB_THRESHOLD
 
-        # Semantic embedding safe (new — catches paraphrase / same flow different words)
-        emb_safe = (
-            use_semantic
-            and has_flow
-            and sem_cos is not None
-            and sem_cos >= SEMANTIC_EMB_SAFE_THRESHOLD
-        )
-
-        # Semantic embedding review (catches same flow, moderate similarity)
-        emb_review = (
-            use_semantic
-            and has_flow
-            and sem_cos is not None
-            and sem_cos >= SEMANTIC_EMB_REVIEW_THRESHOLD
-        )
-
-        if exact_safe:
-            decision  = "SAFEDELETESTRICT"
-            dup_type  = "EXACT"
-            sim_out   = 1.000
-            deleted_already.add(del_idx)
-        elif token_safe or emb_safe:
-            decision  = "SAFEDELETESTRICT"
-            dup_type  = "SEMANTIC_EMB"
-            sim_out   = sem_cos if (sem_cos is not None) else jac
-            deleted_already.add(del_idx)
-        elif emb_review or tfidf_cos >= CANDIDATE_COS_THRESHOLD:
-            decision  = "QA_REVIEW"
-            dup_type  = "SEMANTIC_EMB"
-            sim_out   = sem_cos if (use_semantic and sem_cos is not None) else tfidf_cos
-        else:
+        if not (exact or token_confident or emb_confident):
             continue
 
-        if round(float(sim_out), 3) < 0.75:
+        similarity = 1.0 if exact else (sc if sc is not None else jac)
+
+        if round(float(similarity), 3) < MIN_SIMILARITY_OUTPUT:
             continue
 
-        out_rows.append({
-            "Issue Key (Keep)":   work["_key"].iloc[keep_idx],
-            "Issue Key (Delete)": work["_key"].iloc[del_idx],
-            "Duplicate Type":     dup_type,
-            "Similarity":         round(float(sim_out), 3),
-            "Decision":           decision,
-            "Shared Flows":       ", ".join(sorted(shared_flows)) if shared_flows else "—",
-            # Diagnostics
-            "TF-IDF Cosine":      round(float(tfidf_cos), 3),
-            "Semantic Cosine":    round(float(sem_cos), 3) if sem_cos is not None else "N/A",
-            "Jaccard":            round(float(jac), 3),
-            "SharedTokens":       int(shared),
-            "TokCountKeep":       int(tok_keep),
-            "TokCountDelete":     int(tok_del),
+        rows.append({
+            "Issue (Keep)":      work["_key"].iloc[ki],
+            "Issue (Duplicate)": work["_key"].iloc[di],
+            "Similarity":        round(float(similarity), 3),
         })
-        edges_for_cluster.append((keep_idx, del_idx))
+        deleted.add(di)
+        edges.append((ki, di))
 
-    out_df = pd.DataFrame(out_rows)
-
-    if not out_df.empty:
-        order = {"SAFEDELETESTRICT": 0, "QA_REVIEW": 1}
-        out_df["_ord"] = out_df["Decision"].map(order).fillna(9)
-        out_df = (
-            out_df
-            .sort_values(["_ord", "Similarity"], ascending=[True, False])
-            .drop(columns=["_ord"])
-        )
-
-    safe_df   = out_df[out_df["Decision"] == "SAFEDELETESTRICT"].copy() if not out_df.empty else pd.DataFrame()
-    review_df = out_df[out_df["Decision"] == "QA_REVIEW"].copy()        if not out_df.empty else pd.DataFrame()
+    dup_df = pd.DataFrame(rows)
+    if not dup_df.empty:
+        dup_df = dup_df.sort_values("Similarity", ascending=False).reset_index(drop=True)
 
     # Clusters
-    clusters = connected_components(n, edges_for_cluster) if edges_for_cluster else []
+    clusters   = connected_components(n, edges) if edges else []
     cluster_df = None
     if clusters:
         cluster_rows = []
         for cid, comp in enumerate(clusters, start=1):
-            members = [work["_key"].iloc[i] for i in comp]
-            flows   = set()
+            members    = [work["_key"].iloc[i] for i in comp]
+            flows_all: Set[str] = set()
             for i in comp:
-                flows |= get_flows(work["_set"].iloc[i])
+                flows_all |= get_flows(work["_set"].iloc[i])
             cluster_rows.append({
-                "Cluster":      cid,
-                "Size":         len(comp),
-                "Flows":        ", ".join(sorted(flows)),
-                "Members":      ", ".join(members),
+                "Cluster": cid,
+                "Size":    len(comp),
+                "Flow":    ", ".join(sorted(flows_all)),
+                "Members": ", ".join(members),
             })
-        cluster_df = pd.DataFrame(cluster_rows).sort_values(
-            ["Size", "Cluster"], ascending=[False, True]
+        cluster_df = (
+            pd.DataFrame(cluster_rows)
+            .sort_values(["Size", "Cluster"], ascending=[False, True])
+            .reset_index(drop=True)
         )
 
-    # Summary
     summary_df = pd.DataFrame([
-        {"Metric": "Total issues",                   "Value": int(n)},
-        {"Metric": "Semantic model",                 "Value": SENTENCE_MODEL_NAME if use_semantic else "TF-IDF only"},
-        {"Metric": "TF-IDF candidate threshold",     "Value": CANDIDATE_COS_THRESHOLD},
-        {"Metric": "Top-K neighbors",                "Value": TOP_K_NEIGHBORS},
-        {"Metric": "Emb SAFE threshold",             "Value": SEMANTIC_EMB_SAFE_THRESHOLD if use_semantic else "N/A"},
-        {"Metric": "Emb REVIEW threshold",           "Value": SEMANTIC_EMB_REVIEW_THRESHOLD if use_semantic else "N/A"},
-        {"Metric": "SAFE token Jaccard threshold",   "Value": SAFE_JACCARD_THRESHOLD},
-        {"Metric": "SAFE min shared tokens",         "Value": SAFE_MIN_SHARED_TOKENS},
-        {"Metric": "SAFE TF-IDF cosine guard",       "Value": SAFE_MIN_SEMANTIC_COSINE},
-        {"Metric": "Flow overlap required",          "Value": "YES"},
-        {"Metric": "SAFEDELETESTRICT count",         "Value": int(len(safe_df))   if not safe_df.empty   else 0},
-        {"Metric": "QA_REVIEW count",                "Value": int(len(review_df)) if not review_df.empty else 0},
-        {"Metric": "Total flagged",                  "Value": int(len(out_df))    if not out_df.empty    else 0},
-        {"Metric": "Cluster count",                  "Value": int(len(cluster_df)) if cluster_df is not None else 0},
+        {"Metric": "Total issues",          "Value": int(n)},
+        {"Metric": "Semantic model",        "Value": SENTENCE_MODEL_NAME if use_emb else "TF-IDF only"},
+        {"Metric": "Embedding threshold",   "Value": SEMANTIC_EMB_THRESHOLD},
+        {"Metric": "Min similarity output", "Value": MIN_SIMILARITY_OUTPUT},
+        {"Metric": "Flow guard",            "Value": "YES — min 1 shared flow required"},
+        {"Metric": "Duplicates found",      "Value": int(len(dup_df)) if not dup_df.empty else 0},
+        {"Metric": "Clusters",              "Value": int(len(cluster_df)) if cluster_df is not None else 0},
     ])
 
-    display_cols = ["Issue Key (Keep)", "Issue Key (Delete)", "Duplicate Type",
-                    "Similarity", "Decision"]
-    safe_display   = safe_df[display_cols].copy()   if not safe_df.empty   else pd.DataFrame(columns=display_cols)
-    review_display = review_df[display_cols].copy() if not review_df.empty else pd.DataFrame(columns=display_cols)
-
-    return summary_df, safe_display, review_display, cluster_df, out_df
+    return summary_df, dup_df, cluster_df
 
 
 # ----------------------------
 # Streamlit UI
 # ----------------------------
 def main():
-    st.set_page_config(
-        page_title="Defect Duplicate Detector — Semantic",
-        layout="wide",
-    )
-    st.title("🔍 Defect Duplicate Detector — Semantic + Flow Aware")
+    st.set_page_config(page_title="Defect Duplicate Detector", layout="wide")
+    st.title("Defect Duplicate Detector")
 
-    st.markdown(
-        """
-        **Pipeline:**  
-        1. TF-IDF cosine → candidate pairs  
-        2. `sentence-transformers` multilingual embedding → semantic similarity  
-        3. User-flow grouping (auth, messaging, calling, …) → scenario match guard  
-        4. Combined scoring → **SAFEDELETESTRICT** / **QA_REVIEW**
-        """
-    )
-
-    # Load model eagerly so user sees progress
     model = load_sentence_model()
     if model is None:
         st.warning("Running in TF-IDF only mode — install sentence-transformers for full semantic detection.")
@@ -460,67 +348,46 @@ def main():
     if not uploaded:
         st.stop()
 
-    raw = uploaded.getvalue().decode("utf-8", errors="replace")
+    raw  = uploaded.getvalue().decode("utf-8", errors="replace")
     work, created_dt, detected = load_and_preprocess(raw)
 
     with st.expander("Detected columns", expanded=False):
         st.json(detected)
 
-    # Encode with semantic model
-    raw_texts = tuple(work["_raw_text"].tolist())
-    emb = encode_texts(model, raw_texts) if model is not None else None
+    emb = encode_texts(model, tuple(work["_raw"].tolist())) if model else None
 
-    with st.spinner("Running duplicate detection pipeline…"):
-        summary_df, safe_view, review_view, cluster_df, full_df = run_pipeline(work, created_dt, emb)
+    with st.spinner("Analysing..."):
+        summary_df, dup_df, cluster_df = run_pipeline(work, created_dt, emb)
 
-    # ── Results ──────────────────────────────────────────────────────────
-    st.subheader("📊 Summary")
+    st.subheader("Summary")
     st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
-    col1, col2 = st.columns(2)
-    with col1:
-        safe_count   = len(safe_view)   if not safe_view.empty   else 0
-        review_count = len(review_view) if not review_view.empty else 0
-        st.metric("SAFEDELETESTRICT", safe_count)
-    with col2:
-        st.metric("QA_REVIEW", review_count)
+    st.subheader("Duplicate Issues")
+    if dup_df.empty:
+        st.info("No duplicates found above the confidence threshold.")
+    else:
+        st.dataframe(dup_df, use_container_width=True, hide_index=True)
 
-    st.subheader("✅ SAFEDELETESTRICT")
-    st.caption("These pairs share the same user flow AND exceed the semantic similarity threshold.")
-    st.dataframe(safe_view, use_container_width=True, hide_index=True)
-
-    st.subheader("🔎 QA_REVIEW")
-    st.caption("Possibly duplicate — same flow detected but similarity below auto-delete threshold.")
-    st.dataframe(review_view, use_container_width=True, hide_index=True)
-
-    st.subheader("🕸️ Clusters (Connected Components)")
-    st.caption("Issues connected by at least one duplicate edge, annotated with detected user flows.")
+    st.subheader("Clusters")
     if cluster_df is None:
-        st.write("(empty)")
+        st.info("No clusters.")
     else:
         st.dataframe(cluster_df, use_container_width=True, hide_index=True)
 
-    # ── Downloads ────────────────────────────────────────────────────────
     st.divider()
-    combined_csv  = df_to_section_csv(safe_view,   "SAFEDELETESTRICT")
-    combined_csv += df_to_section_csv(review_view, "QA_REVIEW")
-    combined_csv += df_to_section_csv(cluster_df,  "CLUSTERS")
+    csv_out  = df_to_csv_section(dup_df,     "DUPLICATES")
+    csv_out += df_to_csv_section(cluster_df, "CLUSTERS")
 
-    dl1, dl2 = st.columns(2)
-    with dl1:
-        st.download_button(
-            "⬇️ Download ALL (SAFE + QA + CLUSTERS)",
-            data=combined_csv.encode("utf-8"),
-            file_name="defect_duplicates_all.csv",
-            mime="text/csv",
-        )
-    with dl2:
-        st.download_button(
-            "⬇️ Download Full Diagnostics",
-            data=full_df.to_csv(index=False).encode("utf-8") if full_df is not None else b"",
-            file_name="defect_duplicates_diagnostics.csv",
-            mime="text/csv",
-        )
+    st.download_button(
+        "Download Results (Duplicates + Clusters)",
+        data=csv_out.encode("utf-8"),
+        file_name="defect_duplicates.csv",
+        mime="text/csv",
+    )
+
+
+if __name__ == "__main__":
+    main()
 
 
 if __name__ == "__main__":

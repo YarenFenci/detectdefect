@@ -1,5 +1,5 @@
 # app.py
-# BSDV_CLEAN_DEFECT_HYBRID v3.0 (Production) - One-time config update
+# BSDV_CLEAN_DEFECT_HYBRID (Current) — Single Download CSV + Separate Tables
 # -----------------------------------------------------------------------------
 # Candidate Generation:
 #   - TF-IDF cosine >= 0.65
@@ -11,16 +11,18 @@
 #       (Jaccard >= 0.80 AND shared_tokens >= 5) OR (cosine >= 0.92)
 #
 # QA_REVIEW:
-#   - 0.65 <= cosine < SAFE threshold (i.e., not SAFEDELETESTRICT)
+#   - 0.65 <= cosine < SAFE threshold (i.e., candidate but not SAFE)
 #
 # Clustering:
 #   - connected components (duplicate groups)
 #
-# Output:
-#   - Two tables + downloads:
-#       SAFEDELETESTRICT and QA_REVIEW
-#   - Output columns:
-#       Issue Key (Keep), Issue Key (Delete), Duplicate Type, Similarity, Decision
+# UI:
+#   - Separate tables: SAFEDELETESTRICT, QA_REVIEW, CLUSTERS
+# Download:
+#   - ONE CSV file containing 3 sections (SAFE / QA_REVIEW / CLUSTERS)
+#
+# Output Columns (SAFE/QA):
+#   Issue Key (Keep), Issue Key (Delete), Duplicate Type, Similarity, Decision
 #
 # requirements.txt:
 #   streamlit
@@ -55,6 +57,7 @@ ve veya ama eğer ise değil için ile
 """.split()
 )
 
+# User said: ignore log / version / reproduction differences
 IGNORE_REGEXES = [
     r"\b(app\s*)?version\s*[:=]\s*[^\n\r]+",
     r"\bbuild\s*[:=]\s*[^\n\r]+",
@@ -112,7 +115,7 @@ def parse_created(series: pd.Series) -> pd.Series:
 def determine_keep_delete(i: int, j: int, created_dt: Optional[pd.Series]) -> Tuple[int, int]:
     # Deterministic KEEP:
     # - older created date KEEP, if both parseable
-    # - else earlier row KEEP
+    # - else lower row index KEEP
     if created_dt is not None:
         ci, cj = created_dt.iloc[i], created_dt.iloc[j]
         if pd.notna(ci) and pd.notna(cj):
@@ -120,6 +123,16 @@ def determine_keep_delete(i: int, j: int, created_dt: Optional[pd.Series]) -> Tu
     return (i, j) if i < j else (j, i)
 
 
+def df_to_section_csv(df: Optional[pd.DataFrame], title: str) -> str:
+    header = f"# {title}\n"
+    if df is None or df.empty:
+        return header + "(empty)\n\n"
+    return header + df.to_csv(index=False) + "\n"
+
+
+# ----------------------------
+# Data prep / TF-IDF neighbors
+# ----------------------------
 @st.cache_data(show_spinner=False)
 def load_and_preprocess(raw_csv: str):
     df = pd.read_csv(StringIO(raw_csv), sep=None, engine="python", on_bad_lines="skip")
@@ -199,10 +212,13 @@ def connected_components(n: int, edges: List[Tuple[int, int]]) -> List[List[int]
     return comps
 
 
+# ----------------------------
+# Core pipeline
+# ----------------------------
 def run_pipeline(work: pd.DataFrame, created_dt: Optional[pd.Series]):
     n = len(work)
 
-    # 1) EXACT duplicates
+    # 1) EXACT duplicates (normalized equality)
     seen_norm: Dict[str, int] = {}
     exact_pairs: List[Tuple[int, int]] = []
     exact_deleted: Set[int] = set()
@@ -218,9 +234,10 @@ def run_pipeline(work: pd.DataFrame, created_dt: Optional[pd.Series]):
         else:
             seen_norm[nm] = i
 
-    # 2) Candidates via TF-IDF cosine (top-k)
+    # 2) Candidate generation via TF-IDF cosine
     nn_idx, nn_sim = tfidf_topk_neighbors(work["_norm"].tolist(), TOP_K_NEIGHBORS)
 
+    # Deduplicate candidate pairs, keep best cosine
     cand_best: Dict[Tuple[int, int], float] = {}
     for i in range(n):
         for pos in range(nn_idx.shape[1]):
@@ -240,12 +257,12 @@ def run_pipeline(work: pd.DataFrame, created_dt: Optional[pd.Series]):
     # 3) Decide SAFEDELETESTRICT vs QA_REVIEW
     safe_deleted: Set[int] = set(exact_deleted)
 
-    rows: List[Dict] = []
-    edges: List[Tuple[int, int]] = []
+    out_rows: List[Dict] = []
+    edges_for_cluster: List[Tuple[int, int]] = []
 
-    # EXACT -> SAFEDELETESTRICT
+    # EXACT -> SAFE
     for keep_idx, del_idx in exact_pairs:
-        rows.append(
+        out_rows.append(
             {
                 "Issue Key (Keep)": work["_key"].iloc[keep_idx],
                 "Issue Key (Delete)": work["_key"].iloc[del_idx],
@@ -254,7 +271,7 @@ def run_pipeline(work: pd.DataFrame, created_dt: Optional[pd.Series]):
                 "Decision": "SAFEDELETESTRICT",
             }
         )
-        edges.append((keep_idx, del_idx))
+        edges_for_cluster.append((keep_idx, del_idx))
 
     # SEMANTIC candidates
     for a, b, cos in candidate_pairs:
@@ -272,7 +289,6 @@ def run_pipeline(work: pd.DataFrame, created_dt: Optional[pd.Series]):
         if is_safe:
             decision = "SAFEDELETESTRICT"
             dup_type = "SEMANTIC"
-            # Similarity output: cosine if override triggered, else jaccard
             sim_out = cos if cos >= SAFE_COSINE_OVERRIDE else jac
             safe_deleted.add(del_idx)
         else:
@@ -280,7 +296,7 @@ def run_pipeline(work: pd.DataFrame, created_dt: Optional[pd.Series]):
             dup_type = "SEMANTIC"
             sim_out = cos
 
-        rows.append(
+        out_rows.append(
             {
                 "Issue Key (Keep)": work["_key"].iloc[keep_idx],
                 "Issue Key (Delete)": work["_key"].iloc[del_idx],
@@ -289,28 +305,31 @@ def run_pipeline(work: pd.DataFrame, created_dt: Optional[pd.Series]):
                 "Decision": decision,
             }
         )
-        edges.append((keep_idx, del_idx))
+        edges_for_cluster.append((keep_idx, del_idx))
 
-    out_df = pd.DataFrame(rows)
+    out_df = pd.DataFrame(out_rows)
 
+    # Sort: SAFE first, then QA; within, higher similarity first
     if not out_df.empty:
         order = {"SAFEDELETESTRICT": 0, "QA_REVIEW": 1}
         out_df["_ord"] = out_df["Decision"].map(order).fillna(9)
         out_df = out_df.sort_values(["_ord", "Similarity"], ascending=[True, False]).drop(columns=["_ord"])
 
-    # 4) Clustering (connected components) for viewing groups
-    clusters = connected_components(n, edges) if edges else []
+    safe_df = out_df[out_df["Decision"] == "SAFEDELETESTRICT"].copy() if not out_df.empty else pd.DataFrame(columns=["Issue Key (Keep)","Issue Key (Delete)","Duplicate Type","Similarity","Decision"])
+    review_df = out_df[out_df["Decision"] == "QA_REVIEW"].copy() if not out_df.empty else pd.DataFrame(columns=["Issue Key (Keep)","Issue Key (Delete)","Duplicate Type","Similarity","Decision"])
+
+    # 4) Clustering
+    clusters = connected_components(n, edges_for_cluster) if edges_for_cluster else []
     cluster_df = None
     if clusters:
         cluster_rows = []
         for cid, comp in enumerate(clusters, start=1):
             members = [work["_key"].iloc[i] for i in comp]
-            cluster_rows.append(
-                {"Cluster": cid, "Size": len(comp), "Members": ", ".join(members)}
-            )
+            cluster_rows.append({"Cluster": cid, "Size": len(comp), "Members": ", ".join(members)})
         cluster_df = pd.DataFrame(cluster_rows).sort_values(["Size", "Cluster"], ascending=[False, True])
 
-    summary = pd.DataFrame(
+    # Summary table
+    summary_df = pd.DataFrame(
         [
             {"Metric": "Total issue count", "Count": int(n)},
             {"Metric": "Candidate cosine threshold", "Count": CANDIDATE_COS_THRESHOLD},
@@ -318,17 +337,15 @@ def run_pipeline(work: pd.DataFrame, created_dt: Optional[pd.Series]):
             {"Metric": "SAFE: Jaccard threshold", "Count": SAFE_JACCARD_THRESHOLD},
             {"Metric": "SAFE: shared tokens", "Count": SAFE_MIN_SHARED_TOKENS},
             {"Metric": "SAFE: cosine override", "Count": SAFE_COSINE_OVERRIDE},
-            {"Metric": "SAFEDELETESTRICT", "Count": int((out_df["Decision"] == "SAFEDELETESTRICT").sum()) if not out_df.empty else 0},
-            {"Metric": "QA_REVIEW", "Count": int((out_df["Decision"] == "QA_REVIEW").sum()) if not out_df.empty else 0},
+            {"Metric": "Exact duplicate count", "Count": int((safe_df["Duplicate Type"] == "EXACT").sum()) if not safe_df.empty else 0},
+            {"Metric": "SAFEDELETESTRICT", "Count": int(len(safe_df))},
+            {"Metric": "QA_REVIEW", "Count": int(len(review_df))},
             {"Metric": "Total flagged", "Count": int(len(out_df))},
             {"Metric": "Cluster count", "Count": int(len(cluster_df)) if cluster_df is not None else 0},
         ]
     )
 
-    safe_df = out_df[out_df["Decision"] == "SAFEDELETESTRICT"].copy() if not out_df.empty else pd.DataFrame(columns=out_df.columns if isinstance(out_df, pd.DataFrame) else [])
-    review_df = out_df[out_df["Decision"] == "QA_REVIEW"].copy() if not out_df.empty else pd.DataFrame(columns=out_df.columns if isinstance(out_df, pd.DataFrame) else [])
-
-    return summary, safe_df, review_df, cluster_df, out_df
+    return summary_df, safe_df, review_df, cluster_df
 
 
 # ----------------------------
@@ -338,7 +355,7 @@ def main():
     st.set_page_config(page_title="BSDV_CLEAN_DEFECT_HYBRID (Current)", layout="wide")
     st.title("BSDV_CLEAN_DEFECT_HYBRID (Current)")
 
-    uploaded = st.file_uploader("Upload defects CSV", type=["csv"])
+    uploaded = st.file_uploader("Upload defects CSV", type=["csv"], key="uploader_defects_csv")
     if not uploaded:
         st.stop()
 
@@ -348,11 +365,11 @@ def main():
     st.write("Detected columns:")
     st.json(detected)
 
-    with st.spinner("Running..."):
-        summary, safe_df, review_df, cluster_df, out_df = run_pipeline(work, created_dt)
+    with st.spinner("Running pipeline..."):
+        summary_df, safe_df, review_df, cluster_df = run_pipeline(work, created_dt)
 
     st.subheader("Summary")
-    st.dataframe(summary, use_container_width=True, hide_index=True)
+    st.dataframe(summary_df, use_container_width=True, hide_index=True)
 
     st.subheader("SAFEDELETESTRICT")
     st.dataframe(safe_df, use_container_width=True, hide_index=True)
@@ -360,38 +377,28 @@ def main():
     st.subheader("QA_REVIEW")
     st.dataframe(review_df, use_container_width=True, hide_index=True)
 
-    st.download_button(
-        "Download SAFEDELETESTRICT CSV",
-        data=safe_df.to_csv(index=False).encode("utf-8"),
-        file_name="SAFEDELETESTRICT.csv",
-        mime="text/csv",
-    )
-    st.download_button(
-        "Download QA_REVIEW CSV",
-        data=review_df.to_csv(index=False).encode("utf-8"),
-        file_name="QA_REVIEW.csv",
-        mime="text/csv",
-    )
-    st.download_button(
-        "Download FULL OUTPUT CSV",
-        data=out_df.to_csv(index=False).encode("utf-8"),
-        file_name="BSDV_CLEAN_DEFECT_HYBRID_OUTPUT.csv",
-        mime="text/csv",
-    )
-
-    if cluster_df is not None:
-        st.subheader("Clusters (Connected Components)")
+    st.subheader("CLUSTERS (Connected Components)")
+    if cluster_df is None:
+        st.write("(empty)")
+    else:
         st.dataframe(cluster_df, use_container_width=True, hide_index=True)
-        st.download_button(
-            "Download CLUSTERS CSV",
-            data=cluster_df.to_csv(index=False).encode("utf-8"),
-            file_name="DUPLICATE_CLUSTERS.csv",
-            mime="text/csv",
-        )
+
+    # One CSV download with 3 sections
+    combined_csv = ""
+    combined_csv += df_to_section_csv(safe_df, "SAFEDELETESTRICT")
+    combined_csv += df_to_section_csv(review_df, "QA_REVIEW")
+    combined_csv += df_to_section_csv(cluster_df, "CLUSTERS")
+
+    st.download_button(
+        "Download ALL (SAFE + QA_REVIEW + CLUSTERS) as ONE CSV",
+        data=combined_csv.encode("utf-8"),
+        file_name="BSDV_CLEAN_DEFECT_HYBRID_ALL.csv",
+        mime="text/csv",
+        key="dl_all_one",
+    )
 
 
 if __name__ == "__main__":
     main()
-
 
 

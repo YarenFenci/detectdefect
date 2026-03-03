@@ -351,6 +351,9 @@ def run_pipeline(work: pd.DataFrame, created_dt: Optional[pd.Series], emb: Optio
         else:
             continue
 
+        if round(float(sim_out), 3) < 0.75:
+            continue
+
         out_rows.append({
             "Issue Key (Keep)":   work["_key"].iloc[keep_idx],
             "Issue Key (Delete)": work["_key"].iloc[del_idx],
@@ -421,7 +424,7 @@ def run_pipeline(work: pd.DataFrame, created_dt: Optional[pd.Series], emb: Optio
     ])
 
     display_cols = ["Issue Key (Keep)", "Issue Key (Delete)", "Duplicate Type",
-                    "Similarity", "Shared Flows", "Decision"]
+                    "Similarity", "Decision"]
     safe_display   = safe_df[display_cols].copy()   if not safe_df.empty   else pd.DataFrame(columns=display_cols)
     review_display = review_df[display_cols].copy() if not review_df.empty else pd.DataFrame(columns=display_cols)
 
@@ -518,10 +521,6 @@ def main():
             file_name="defect_duplicates_diagnostics.csv",
             mime="text/csv",
         )
-
-
-if __name__ == "__main__":
-    main()
 
 
 if __name__ == "__main__":

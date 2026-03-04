@@ -13,7 +13,7 @@ import streamlit as st
 CANDIDATE_TFIDF_THRESHOLD = 0.40
 TOP_K_NEIGHBORS           = 50
 EMB_EXACT_THRESHOLD       = 0.97   # cosine >= this -> Exact (near-identical content)
-EMB_SEMANTIC_THRESHOLD    = 0.84   # cosine >= this -> Semantic (same meaning, different words)
+EMB_SEMANTIC_THRESHOLD    = 0.82   # cosine >= this -> Semantic (same meaning, different words)
 MIN_TOKENS                = 8
 
 SENTENCE_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
@@ -223,7 +223,13 @@ def run_pipeline(
 
         norm_ki = work["_norm"].iloc[ki]
         norm_di = work["_norm"].iloc[di]
-        if norm_ki == norm_di or score >= EMB_EXACT_THRESHOLD:
+        set_ki  = work["_set"].iloc[ki]
+        set_di  = work["_set"].iloc[di]
+
+        # Exact: identical text OR token overlap >= 95%
+        tok_union = len(set_ki | set_di)
+        jac = len(set_ki & set_di) / tok_union if tok_union > 0 else 0.0
+        if norm_ki == norm_di or jac >= 0.90:
             dup_type = "Exact"
         else:
             dup_type = "Semantic"

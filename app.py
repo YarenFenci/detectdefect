@@ -13,7 +13,7 @@ import streamlit as st
 CANDIDATE_TFIDF_THRESHOLD = 0.40
 TOP_K_NEIGHBORS           = 50
 EMB_EXACT_THRESHOLD       = 0.97   # cosine >= this -> Exact (near-identical content)
-EMB_SEMANTIC_THRESHOLD    = 0.75   # cosine >= this -> Semantic (same meaning, different words)
+EMB_SEMANTIC_THRESHOLD    = 0.84   # cosine >= this -> Semantic (same meaning, different words)
 MIN_TOKENS                = 8
 
 SENTENCE_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
